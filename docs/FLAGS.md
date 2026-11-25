@@ -30,6 +30,7 @@ The four `earth.*` flags for canopy, maps, realms and forests are read when a wo
 | `earthplatform.earth.transfers` | many | Downloads at once from the Amazon open data buckets (elevation tiles 48, 3DEP, HRDEM, REMA and land cover 24, Copernicus 16); `few` keeps the 16, 6 and 8 of before, for comparing. Climate and surface water keep theirs | `CubicSettings.transfers` |
 | `earthplatform.earth.everyLayer` | `false` | `true` lays every elevation layer over every tile, as before: also the Copernicus fill and HRDEM under a tile that 3DEP then replaces whole. The tiles come out the same; for comparing a travel's waits | `TerrariumTileSource.first` |
 | `earthplatform.preload.parallel` | 3 | Places `/earth preload` fetches at once, 1 to 8 | `EarthAdmin` |
+| `earthplatform.preload.mostAreas` | 20000 | Most 6 km squares one `/earth preload` fetches | `EarthAdmin` |
 | `earthplatform.earth.prepareLog` | `false` | Logs, after each fetch of a place's data, which pieces came in last and how long each took: what a travel waited on | `EarthGenerator.prepare` |
 | `earthplatform.earth.home` | Yosemite Valley | Default home of new worlds, as `LAT,LON` | `EarthSettings` |
 | `earthplatform.earth.copernicus` | on | `false` leaves the Copernicus 30 m fill out of new worlds | `CubicSettings.elevation()` |
