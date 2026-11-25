@@ -102,6 +102,9 @@ That was a bug in early test builds and is fixed. Update to the latest version.
 **How do I run a server?**
 Set `level-type=earthplatform\:earth` in `server.properties` before the world is created. See [Dedicated servers](INSTALL.md#dedicated-servers). The server needs internet access; players need the mod but not the data.
 
+**How do I keep a big server smooth when players fly ships or sail fast?**
+Download the places they go before they get there: `/earth preload <km>` around the spawn, and `/earth preload route <from lat> <from lon> <to lat> <to lon> [width km]` along a regular ship or airship route. For the ground itself, [Chunky](https://modrinth.com/plugin/chunky) pre-generates the Earth world too. While they travel, players moving faster than 20 blocks a second get the ground ahead of them first and the data along their way fetched ahead, and at sea the deep water under them comes as plain water until they slow down. `/earth admin` shows how many are travelling fast and how many cubes had to be made on the server thread, which a ship's physics asks for when it reaches ground that isn't ready.
+
 ## License
 
 **Can I put it in a modpack, or change the code?**

@@ -148,7 +148,8 @@ These are for operators, and all of them work from the server console too. Where
 | `/earth border reset` | No border |
 | `/earth race start [place]` | A race to a famous place (a random one unless named). The first player to get within 250 meters wins the prize; a travel command takes a player out. `/earth race stop` calls it off |
 | `/earth guess start [players]` | A Where on Earth round, a guessing game: everyone is dropped at the same random spot and marks on the globe where they think they are. Points by distance, up to 5000. `/earth guess end` reveals early; `/earth guess scores` totals the rounds |
-| `/earth preload <km>` | Downloads the Earth data within that many kilometers of the server spawn ahead of time, nearest first. `/earth preload stop` ends it |
+| `/earth preload <km>` | Downloads the Earth data within that many kilometers of the server spawn ahead of time, nearest first, three areas at a time. `/earth preload stop` ends it |
+| `/earth preload route <from lat> <from lon> <to lat> <to lon> [width km]` | Downloads the Earth data along a straight line on the map between two places, the way a ship or airship flies a steady heading, from the first place on. With a width, that many kilometers across; up to 5,000 areas (about 30,000 km one area wide). A route does not cross the date line: split it there |
 | `/earth settings` | Lists every feature below with clickable **[ON]** / **[OFF]** buttons. `/earth settings <feature> on` or `off` switches one, `/earth settings travelCost 3` sets a number. Saved to the config file and in effect at once, no restart |
 | `/earth admin` | Server status: TPS, memory, downloads, cache size, border, warps, web map and who is online (click a name to go there) |
 

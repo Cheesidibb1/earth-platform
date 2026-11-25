@@ -221,6 +221,9 @@ public abstract class SurfaceGenerator implements CubeGenerator {
         return low;
     }
 
+    /** The cube column's own highest ground, from the column its cubes are made from. */
+    @Override public final int highestGround(int cubeX, int cubeZ) { return column(cubeX, cubeZ).max; }
+
     @Override public final int highestSurface(int cubeX, int cubeZ) {
         Column column = column(cubeX, cubeZ);
         return Math.max(column.max, column.maxWater);

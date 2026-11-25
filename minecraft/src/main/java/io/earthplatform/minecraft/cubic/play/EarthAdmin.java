@@ -47,8 +47,18 @@ import net.minecraft.server.level.ServerPlayer;
  */
 public final class EarthAdmin {
     /** How far apart preloaded points are, in blocks: each fetches what the cubes within 3.5 km read. */
-    private static final int PRELOAD_STEP = 6000;
+    static final int PRELOAD_STEP = 6000;
     private static final double PRELOAD_MOST_KM = 250;
+    /** Longest route {@code /earth preload route} takes, in points: 30,000 km of a corridor one point wide. */
+    static final int ROUTE_MOST_POINTS = 5000;
+    /** Widest corridor of a route, in kilometres. */
+    private static final double ROUTE_MOST_WIDTH_KM = 60;
+    /**
+     * Points fetched at once. Each point's own pieces already download together, but a point waits on its slowest
+     * piece, so one at a time left the connection idle between points; a few at once keep it busy without crowding
+     * out the downloads players' cubes are waiting on.
+     */
+    static final int PRELOAD_PARALLEL = Math.clamp(Integer.getInteger("earthplatform.preload.parallel", 3), 1, 8);
 
     @Nullable private static volatile AtomicBoolean preloading;
 
@@ -63,6 +73,18 @@ public final class EarthAdmin {
                     context.getSource().sendSuccess(() -> Component.literal("Stopping the preload."), true);
                     return 1;
                 }))
+                .then(Commands.literal("route")
+                        .then(Commands.argument("fromLatitude", DoubleArgumentType.doubleArg(-85, 85))
+                        .then(Commands.argument("fromLongitude", DoubleArgumentType.doubleArg(-180, 180))
+                        .then(Commands.argument("toLatitude", DoubleArgumentType.doubleArg(-85, 85))
+                        .then(Commands.argument("toLongitude", DoubleArgumentType.doubleArg(-180, 180))
+                                .executes(context -> route(context.getSource(), DoubleArgumentType.getDouble(context, "fromLatitude"),
+                                        DoubleArgumentType.getDouble(context, "fromLongitude"), DoubleArgumentType.getDouble(context, "toLatitude"),
+                                        DoubleArgumentType.getDouble(context, "toLongitude"), 0))
+                                .then(Commands.argument("widthKm", DoubleArgumentType.doubleArg(0, ROUTE_MOST_WIDTH_KM))
+                                        .executes(context -> route(context.getSource(), DoubleArgumentType.getDouble(context, "fromLatitude"),
+                                                DoubleArgumentType.getDouble(context, "fromLongitude"), DoubleArgumentType.getDouble(context, "toLatitude"),
+                                                DoubleArgumentType.getDouble(context, "toLongitude"), DoubleArgumentType.getDouble(context, "widthKm")))))))))
                 .then(Commands.argument("km", DoubleArgumentType.doubleArg(1, PRELOAD_MOST_KM))
                         .executes(context -> preload(context.getSource(), DoubleArgumentType.getDouble(context, "km")))));
         root.then(Commands.literal("admin").requires(EarthCommands::op).executes(context -> status(context.getSource())));
@@ -72,7 +94,7 @@ public final class EarthAdmin {
 
     /**
      * Downloads the Earth data within {@code km} of the one running it (or of the server spawn from
-     * the console), so first visits there are instant. One point at a time, off the server thread.
+     * the console), so first visits there are instant. Nearest first, off the server thread.
      */
     private static int preload(CommandSourceStack source, double km) {
         if (preloading != null) { source.sendFailure(Component.literal("A preload is already running; /earth preload stop ends it.")); return 0; }
@@ -92,28 +114,80 @@ public final class EarthAdmin {
         }
         // Nearest first, so a stopped preload has done the middle.
         points.sort((a, b) -> Long.compare(dist(a, middle), dist(b, middle)));
+        return start(source, earth, points, String.format(Locale.ROOT, "%.0f km around %.4f, %.4f", km, centre.latitude(), centre.longitude()));
+    }
+
+    /**
+     * Downloads the Earth data along a straight line on the map between two places, the way a ship or an airship
+     * flies a steady heading, {@code widthKm} across (one point's reach when 0), from the first place on: a server
+     * whose players run a regular route has it ready before they set out.
+     */
+    private static int route(CommandSourceStack source, double fromLatitude, double fromLongitude, double toLatitude, double toLongitude, double widthKm) {
+        if (preloading != null) { source.sendFailure(Component.literal("A preload is already running; /earth preload stop ends it.")); return 0; }
+        EarthGenerator earth = EarthCommands.earth(source);
+        if (earth == null) { source.sendFailure(Component.literal("This world has no Earth.")); return 0; }
+        int[] from = earth.block(fromLatitude, fromLongitude), to = earth.block(toLatitude, toLongitude);
+        double metres = earth.grid().groundMetresPerBlock((from[1] + to[1]) / 2);
+        List<int[]> points = routePoints(from, to, widthKm * 1000 / metres, PRELOAD_STEP);
+        if (points.size() > ROUTE_MOST_POINTS) {
+            source.sendFailure(Component.literal(String.format(Locale.ROOT, "That route needs %d areas; at most %d are fetched at once. Split it or make it narrower.",
+                    points.size(), ROUTE_MOST_POINTS)));
+            return 0;
+        }
+        return start(source, earth, points, String.format(Locale.ROOT, "the route from %.4f, %.4f to %.4f, %.4f, %.0f km wide",
+                fromLatitude, fromLongitude, toLatitude, toLongitude, widthKm));
+    }
+
+    /**
+     * Points {@code step} blocks apart along the line from {@code from} to {@code to}, both ends included, and as many
+     * either side of it as fit in {@code width} blocks across: in order along the line, the middle of each row first.
+     */
+    static List<int[]> routePoints(int[] from, int[] to, double width, int step) {
+        double dx = to[0] - from[0], dz = to[1] - from[1], length = Math.hypot(dx, dz);
+        double ux = length > 0 ? dx / length : 1, uz = length > 0 ? dz / length : 0;
+        int along = (int) Math.ceil(length / step), side = (int) Math.floor(width / 2 / step);
+        List<int[]> points = new ArrayList<>();
+        for (int i = 0; i <= along; i++) {
+            double t = Math.min(length, (double) i * step);
+            for (int k = 0; k <= 2 * side; k++) {
+                // 0, 1, -1, 2, -2 and so on: the line itself before its sides.
+                int offset = (k + 1) / 2 * (k % 2 == 1 ? 1 : -1) * step;
+                points.add(new int[]{(int) Math.round(from[0] + ux * t - uz * offset), (int) Math.round(from[1] + uz * t + ux * offset)});
+            }
+        }
+        return points;
+    }
+
+    /** Fetches each point's near data, {@link #PRELOAD_PARALLEL} at a time in the given order, telling {@code source} how it goes. */
+    private static int start(CommandSourceStack source, EarthGenerator earth, List<int[]> points, String what) {
         AtomicBoolean running = new AtomicBoolean(true);
         preloading = running;
         MinecraftServer server = source.getServer();
-        source.sendSuccess(() -> Component.literal(String.format(Locale.ROOT, "Preloading %.0f km around %.4f, %.4f (%d areas). /earth preload stop ends it.",
-                km, centre.latitude(), centre.longitude(), points.size())).withStyle(ChatFormatting.GREEN), true);
+        source.sendSuccess(() -> Component.literal(String.format(Locale.ROOT, "Preloading %s (%d areas, %d at a time). /earth preload stop ends it.",
+                what, points.size(), PRELOAD_PARALLEL)).withStyle(ChatFormatting.GREEN), true);
         Map<String, long[]> before = Downloads.totals();
         long start = Util.getMillis();
-        AtomicInteger failed = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger(), done = new AtomicInteger(), told = new AtomicInteger();
         Thread worker = new Thread(() -> {
-            int done = 0, told = 0;
-            for (int[] point : points) {
-                if (!running.get()) break;
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(PRELOAD_PARALLEL,
+                    NamedThreads.numbered("Earth preload", Thread.MIN_PRIORITY));
+            for (int[] point : points) pool.execute(() -> {
+                if (!running.get()) return;
                 try { earth.prepareNear(point[0], point[1]); } catch (RuntimeException failure) { failed.incrementAndGet(); }
-                done++;
-                int tenth = done * 10 / points.size();
-                if (tenth > told && done < points.size()) {
-                    told = tenth;
+                int finished = done.incrementAndGet(), tenth = finished * 10 / points.size(), last = told.get();
+                if (tenth > last && finished < points.size() && told.compareAndSet(last, tenth)) {
                     int percent = tenth * 10;
                     server.execute(() -> source.sendSuccess(() -> Component.literal("Preload " + percent + "% done.").withStyle(ChatFormatting.GRAY), false));
                 }
+            });
+            pool.shutdown();
+            try {
+                while (!pool.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)) { /* waiting for the last points */ }
+            } catch (InterruptedException interrupted) {
+                pool.shutdownNow();
+                Thread.currentThread().interrupt();
             }
-            int finished = done;
+            int finished = done.get();
             String fetched = Downloads.since(before);
             long seconds = (Util.getMillis() - start) / 1000;
             server.execute(() -> {

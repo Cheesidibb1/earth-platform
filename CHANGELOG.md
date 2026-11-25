@@ -58,6 +58,9 @@ The first release of Earth Platform for Minecraft 1.21.1 and NeoForge 21.1.
 ### Servers
 - Dedicated servers with several players on the same Earth.
 - Server commands: spawn picked on the globe, homes, warps, random trips, teleport requests, borders, team starts, country names, GeoGuessr rounds, races, preloading, a status page and a live web map.
+- Players travelling fast (Create Aeronautics ships, boats, minecarts) get the ground the way they are heading first, have the ground a few seconds ahead made before they reach it, and have the Earth data along their way downloaded ahead. Over deep sea at speed, the water well below them comes as plain water until they slow down, and deep water nobody touched is no longer saved, by play or by Chunky.
+- `/earth preload` fetches three areas at once, and `/earth preload route` fetches a corridor between two places. `/earth admin` shows how many players are travelling fast, how much was fetched ahead of them and how many cubes something (such as a ship's physics) had to make on the server thread.
+- Servers with many players spend less time each tick on deciding which cubes to keep and which to random-tick.
 
 ### Other mods
 - Xaero's Minimap, Xaero's World Map and JourneyMap map the Earth world, including ground above Y 2047.

@@ -71,6 +71,12 @@ public interface CubeGenerator {
         }
         return high;
     }
+    /** Highest ground of a cube column, under any water on it. Slow on first use; call off-thread. */
+    default int highestGround(int cubeX, int cubeZ) {
+        int high = Integer.MIN_VALUE;
+        for (int i = 0; i < 256; i++) high = Math.max(high, surfaceY((cubeX << 4) + (i & 15), (cubeZ << 4) + (i >> 4)));
+        return high;
+    }
     /** Top generated water block of a column, or {@link Integer#MIN_VALUE} where it is dry. */
     default int waterY(int x, int z) { return Integer.MIN_VALUE; }
     /** Highest generated block that blocks skylight in a column, used as the initial sky top. */

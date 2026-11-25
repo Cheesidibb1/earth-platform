@@ -13,14 +13,16 @@ class ColumnSurveysTest {
         final List<Runnable> queued = new ArrayList<>();
         int asked;
         LongPredicate failing = column -> false;
+        /** The water gap every survey finds. */
+        long gap = ColumnSurvey.NO_GAP;
         final ColumnSurveys surveys;
 
         Rig(boolean surfaces) {
             surveys = new ColumnSurveys(surfaces, false, queued::add, (column, x, z) -> {
                 asked++;
                 boolean failed = failing.test(column);
-                long low = failed ? ColumnSurvey.FAILED : 40;
-                return surfaces ? new long[] {column, low, failed ? ColumnSurvey.FAILED : 63, failed ? ColumnSurvey.FAILED : 90} : new long[] {column, low};
+                long low = failed ? ColumnSurvey.FAILED : 40, water = failed ? ColumnSurvey.FAILED : gap;
+                return surfaces ? new long[] {column, low, failed ? ColumnSurvey.FAILED : 63, failed ? ColumnSurvey.FAILED : 90, water} : new long[] {column, low, water};
             });
         }
 
@@ -169,5 +171,27 @@ class ColumnSurveysTest {
             for (int y : new int[] {-100, -5, 2, 50})
                 assertEquals(0, worked.surveys.buried(0, y, 0, ColumnSurveys.ANY), "failed neighbour, cube y=" + y);
         }
+    }
+
+    @Test void deepWaterIsKnownOnceItsColumnIsSurveyedAndNeverForASavedCube() {
+        Rig rig = new Rig(false);
+        rig.gap = ColumnSurvey.gap(-180, 0);
+        assertEquals(-1, rig.surveys.waterOnly(4, -50, 4, ColumnSurveys.ANY), "not known yet");
+        assertEquals(1, rig.surveys.inFlight(), "and asked for");
+        rig.finish(0);
+        assertEquals(1, rig.surveys.waterOnly(4, -50, 4, ColumnSurveys.ANY));
+        assertEquals(1, rig.surveys.waterOnly(4, 0, 4, ColumnSurveys.ANY), "the gap's top is in it");
+        assertEquals(0, rig.surveys.waterOnly(4, 1, 4, ColumnSurveys.ANY), "the sea's surface is not");
+        assertEquals(0, rig.surveys.waterOnly(4, -181, 4, ColumnSurveys.ANY), "nor the water over the bed");
+        rig.surveys.keep(CubeKey.pack(4, -50, 4));
+        assertEquals(0, rig.surveys.waterOnly(4, -50, 4, ColumnSurveys.ANY), "a saved cube, such as a sunk base, comes back from the save");
+
+        rig.failing = column -> true;
+        rig.surveys.waterOnly(9, -50, 9, ColumnSurveys.ANY);
+        rig.finish(1);
+        assertEquals(0, rig.surveys.waterOnly(9, -50, 9, ColumnSurveys.ANY), "a failed survey has no gap: its cubes are made");
+        rig.surveys.prune(column -> false);
+        assertEquals(-1, rig.surveys.waterOnly(4, -60, 4, 0), "forgotten with its column; none asked for past the limit");
+        assertEquals(0, rig.surveys.inFlight());
     }
 }

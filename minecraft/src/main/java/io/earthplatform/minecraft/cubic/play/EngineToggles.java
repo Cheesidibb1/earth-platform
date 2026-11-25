@@ -211,6 +211,8 @@ public final class EngineToggles {
             // common file, nearby blocks
             on(COMMON, Group.NEARBY_BLOCKS, "view.order", RESTART),
             off(COMMON, Group.NEARBY_BLOCKS, "cubic.buried", RESTART),
+            on(COMMON, Group.NEARBY_BLOCKS, "cubic.motionAhead", RESTART),
+            on(COMMON, Group.NEARBY_BLOCKS, "cubic.fastSea", RESTART),
             // common file, speedups
             on(COMMON, Group.SPEEDUPS, "rivers.fastSample", RESTART),
             on(COMMON, Group.SPEEDUPS, "cogs.fastRead", RESTART),

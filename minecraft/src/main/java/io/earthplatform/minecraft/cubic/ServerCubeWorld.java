@@ -135,6 +135,20 @@ public final class ServerCubeWorld extends CubeWorld {
     private final LongOpenHashSet skyBuilds = new LongOpenHashSet();
 
     /**
+     * A player travelling fast (see {@link Motion}) over deep water gets the water under them that lies well below
+     * the surface ({@link ColumnSurvey#waterGap}) as a plain water stand-in, not made until they slow down: a ship
+     * crossing an ocean kilometres deep had every cube of water down its view's whole height made, saved and sent.
+     * Such cubes, made the same each time, are not saved untouched either. {@code -Dearthplatform.cubic.fastSea=false}
+     * makes, saves and sends them as before.
+     */
+    static final boolean FAST_SEA = !"false".equals(System.getProperty("earthplatform.cubic.fastSea"));
+    private final byte[] waterStandIn;
+    /** Map data fetched along fast travellers' way; see {@link PathPrefetch}. */
+    private final PathPrefetch prefetch;
+    /** Cubes made or read on the server thread because something needed them at once, such as a Sable ship's physics, and the time it took. */
+    private final java.util.concurrent.atomic.LongAdder serverLoads = new java.util.concurrent.atomic.LongAdder(), serverLoadNanos = new java.util.concurrent.atomic.LongAdder();
+
+    /**
      * A loaded or generated cube; a null section means generating it failed. {@code surface} marks cubes holding the
      * ground still owed their first animals; {@code edited} marks saved cubes changed by play; {@code kept} marks fresh
      * cubes to save as generated.
@@ -161,7 +175,15 @@ public final class ServerCubeWorld extends CubeWorld {
         @Nullable CubeOffsets planOffsets;
         final LongOpenHashSet columns = new LongOpenHashSet();
         final List<CubePayloads.Change> changes = new ArrayList<>();
+        /** How fast and which way the player travels; see {@link Motion}. */
+        final Motion motion = new Motion();
+        /** Cube columns ahead of the player that the cubes ahead are made around, while travelling fast; none otherwise. */
+        int leadX, leadZ;
+        /** Travelling fast: deep water well under the player goes as a stand-in (see {@link #FAST_SEA}). */
+        boolean seaSkip;
         Watcher(ServerPlayer player) { this.player = player; }
+
+        boolean leading() { return leadX != 0 || leadZ != 0; }
     }
 
     public ServerCubeWorld(ServerLevel level, CubeGenerator generator) {
@@ -174,6 +196,10 @@ public final class ServerCubeWorld extends CubeWorld {
         this.standIn = CubeCodec.sectionBytes(new LevelChunkSection(
                 new PalettedContainer<>(Block.BLOCK_STATE_REGISTRY, net.minecraft.world.level.block.Blocks.STONE.defaultBlockState(), PalettedContainer.Strategy.SECTION_STATES),
                 new PalettedContainer<>(biomes.asHolderIdMap(), biomes.getHolderOrThrow(net.minecraft.world.level.biome.Biomes.PLAINS), PalettedContainer.Strategy.SECTION_BIOMES)));
+        this.waterStandIn = CubeCodec.sectionBytes(new LevelChunkSection(
+                new PalettedContainer<>(Block.BLOCK_STATE_REGISTRY, net.minecraft.world.level.block.Blocks.WATER.defaultBlockState(), PalettedContainer.Strategy.SECTION_STATES),
+                new PalettedContainer<>(biomes.asHolderIdMap(), biomes.getHolderOrThrow(net.minecraft.world.level.biome.Biomes.OCEAN), PalettedContainer.Strategy.SECTION_BIOMES)));
+        this.prefetch = new PathPrefetch(generator::prepareNear);
         this.storage = new CubeStorage(DimensionType.getStorageFolder(level.dimension(),
                 level.getServer().getWorldPath(LevelResource.ROOT)).resolve("cubes"));
         storage.onProblem(problem -> {
@@ -295,7 +321,7 @@ public final class ServerCubeWorld extends CubeWorld {
             LevelChunkSection section = generator.generate(x, y, z, blockEntities, entities);
             int[] band = surfaceBand(x, z);
             boolean surface = band[0] + SAVED_BELOW == y;
-            return new Ready(key, x, y, z, section, blockEntities, entities, false, false, surface, y >= band[0] && y <= band[1], null, openFaces(section));
+            return new Ready(key, x, y, z, section, blockEntities, entities, false, false, surface, saved(band, y, x, z), null, openFaces(section));
         } catch (RuntimeException failure) {
             return new Ready(key, x, y, z, null, List.of(), List.of(), false, false, false, false, failure, 0);
         }
@@ -306,7 +332,10 @@ public final class ServerCubeWorld extends CubeWorld {
         long key = CubeKey.pack(x, y, z);
         Cube cube = cubes.get(key);
         if (cube != null) return cube;
+        long start = System.nanoTime();
         adoptReady(produce(key, x, y, z));
+        serverLoads.increment();
+        serverLoadNanos.add(System.nanoTime() - start);
         return cubes.get(key);
     }
 
@@ -373,6 +402,14 @@ public final class ServerCubeWorld extends CubeWorld {
     private static final int SAVED_BELOW = 1;
     private int pregenerated;
 
+    /**
+     * Any thread; reads map data. Whether an untouched cube is saved as generated: within the column's
+     * {@link #surfaceBand}, and not in deep water's {@link ColumnSurvey#waterGap}, which is made the same each time.
+     */
+    private boolean saved(int[] band, int cubeY, int cubeX, int cubeZ) {
+        return cubeY >= band[0] && cubeY <= band[1] && !(FAST_SEA && ColumnSurvey.inGap(ColumnSurvey.waterGap(generator, cubeX, cubeZ), cubeY));
+    }
+
     /** Any thread; reads map data. The lowest and highest cube Y of a cube column that are saved as generated. */
     private int[] surfaceBand(int cubeX, int cubeZ) {
         int x = (cubeX << 4) + 8, z = (cubeZ << 4) + 8;
@@ -388,9 +425,12 @@ public final class ServerCubeWorld extends CubeWorld {
     public void pregenerate(int cubeX, int cubeZ) {
         if (closed) return;
         int[] band = surfaceBand(cubeX, cubeZ);
+        long gap = FAST_SEA ? ColumnSurvey.waterGap(generator, cubeX, cubeZ) : ColumnSurvey.NO_GAP;
         LongArrayList keys = new LongArrayList();
         List<CompoundTag> tags = new ArrayList<>();
         for (int y = band[0]; y <= band[1]; y++) {
+            // Deep water between the bed and the surface is made the same on every visit: nothing to save.
+            if (ColumnSurvey.inGap(gap, y)) continue;
             long key = CubeKey.pack(cubeX, y, cubeZ);
             try { if (storage.read(key) != null) continue; }
             catch (IOException failure) { continue; }
@@ -529,7 +569,8 @@ public final class ServerCubeWorld extends CubeWorld {
         boolean flying = false;
         for (int i = 0; i < order.size(); i++) {
             Watcher watcher = order.get(i);
-            if (JetStream.outrunsTerrain(watcher.player)) { land(watcher); continue; }
+            move(watcher, h);
+            if (JetStream.outrunsTerrain(watcher.player)) { land(watcher); watcher.leadX = watcher.leadZ = 0; continue; }
             watcher.deep = deep(watcher);
             plan(watcher, h, v);
             flying |= watcher.flying;
@@ -551,9 +592,10 @@ public final class ServerCubeWorld extends CubeWorld {
                 continue;
             }
             // The cubes around a flyer are asked for before the columns its surface needs are surveyed, a few at a time.
-            requestAround(watcher, cx, cz, share, SurfaceFlight.surveyCap(watcher.flying, true));
+            int left = requestAround(watcher, cx, cy, cz, share, SurfaceFlight.surveyCap(watcher.flying, true));
+            if (watcher.leading()) requestAhead(watcher, cx, cy, cz, h, v, left, SurfaceFlight.surveyCap(watcher.flying, true));
             int cap = SurfaceFlight.surveyCap(watcher.flying, false);
-            send(watcher, cx, cz, cap);
+            send(watcher, cx, cy, cz, cap);
             if (ticks % 10 == 0) unsend(watcher, h + 1, v + 1, cx, cy, cz, false, cap);
         }
         flushChanges();
@@ -573,6 +615,35 @@ public final class ServerCubeWorld extends CubeWorld {
         return watcher != null && watcher.player == player && watcher.sent.contains(CubeKey.pack(x >> 4, y >> 4, z >> 4));
     }
 
+    /** How far ahead, in cube columns, the cubes ahead of a fast traveller are made about, at most. */
+    private static int leadMost(int h) { return h; }
+
+    /** How far round the point ahead of a fast traveller its cubes are made, in cube columns. */
+    private static int aheadRadius(int h) { return Math.max(2, h / 2); }
+
+    /**
+     * Takes in how a player moved this tick: which way their cubes lean while they travel fast, and the map data along
+     * their way, fetched every second. Gliders and boats the wind or current carries get no near cubes, so none ahead
+     * either.
+     */
+    private void move(Watcher watcher, int h) {
+        var player = watcher.player;
+        Motion motion = watcher.motion;
+        motion.update(player.getX(), player.getZ());
+        int[] lead = motion.lead(leadMost(h));
+        watcher.leadX = lead[0];
+        watcher.leadZ = lead[1];
+        watcher.seaSkip = FAST_SEA && motion.fast();
+        if (motion.fast() && (ticks + player.getId()) % 20 == 0 && !JetStream.outrunsTerrain(player)) {
+            prefetch.ahead(player.getX(), player.getZ(), motion.vx(), motion.vz());
+        }
+    }
+
+    /** Whether a cube is deep water well under a fast traveller, sent as a stand-in for now (see {@link #FAST_SEA}). */
+    private boolean seaStandIn(Watcher watcher, int x, int y, int z, int cy, int cap) {
+        return watcher.seaSkip && y < cy - 1 && surveys.waterOnly(x, y, z, cap) == 1;
+    }
+
     private void syncWatchers() {
         Set<UUID> present = new HashSet<>();
         for (ServerPlayer player : server.players()) {
@@ -588,11 +659,14 @@ public final class ServerCubeWorld extends CubeWorld {
      * keeps. Gliders above all terrain and boats in the ocean current stream no cubes, so nothing queued is wanted for them.
      */
     private void publishWanted(int h, int v) {
-        int[] at = new int[watchers.size() * 3];
+        int[] at = new int[watchers.size() * 6];
         int i = 0;
         for (Watcher watcher : watchers.values()) {
             if (JetStream.outrunsTerrain(watcher.player)) continue;
-            at[i++] = watcher.player.getBlockX() >> 4; at[i++] = watcher.player.getBlockY() >> 4; at[i++] = watcher.player.getBlockZ() >> 4;
+            int x = watcher.player.getBlockX() >> 4, y = watcher.player.getBlockY() >> 4, z = watcher.player.getBlockZ() >> 4;
+            at[i++] = x; at[i++] = y; at[i++] = z;
+            // Cubes asked for ahead of a fast traveller are still wanted when their turn comes.
+            if (watcher.leading()) { at[i++] = x + watcher.leadX; at[i++] = y; at[i++] = z + watcher.leadZ; }
         }
         wantedH = h;
         wantedV = v;
@@ -614,7 +688,9 @@ public final class ServerCubeWorld extends CubeWorld {
     private void plan(Watcher watcher, int h, int v) {
         var player = watcher.player;
         int cx = player.getBlockX() >> 4, cy = player.getBlockY() >> 4, cz = player.getBlockZ() >> 4;
-        int sector = ViewOrder.sector(player.getYRot());
+        // A fast traveller needs the ground they are heading for before what they look at: a pilot looks about the deck.
+        float yaw = watcher.motion.fast() ? (float) watcher.motion.yaw() : player.getYRot();
+        int sector = ViewOrder.sector(yaw);
         CubeOffsets offsets = CubeOffsets.of(h, v, sector);
         watcher.plan.around(offsets, cx, cy, cz);
         if (SurfaceFlight.ENABLED && !watcher.deep) {
@@ -633,7 +709,7 @@ public final class ServerCubeWorld extends CubeWorld {
         LongOpenHashSet surface = new LongOpenHashSet(Math.max(16, watcher.surface.size()));
         SurfaceFlight.surface(cx, cz, h, surveys::surfaceBounds, player.getX(), player.getY(), player.getZ(), surface::add);
         watcher.surface = surface;
-        watcher.plan.surface(surface, player.getX(), player.getY(), player.getZ(), player.getYRot());
+        watcher.plan.surface(surface, player.getX(), player.getY(), player.getZ(), yaw);
     }
 
     /**
@@ -649,7 +725,8 @@ public final class ServerCubeWorld extends CubeWorld {
         watcher.plan.clear();
     }
 
-    private void requestAround(Watcher watcher, int cx, int cz, int limit, int cap) {
+    /** Asks for the cubes about a player, in their plan's order; the requests left of {@code limit}. */
+    private int requestAround(Watcher watcher, int cx, int cy, int cz, int limit, int cap) {
         SurfaceFlight.Plan plan = watcher.plan;
         boolean flying = watcher.flying;
         for (int i = 0; i < plan.size() && limit > 0 && pending.size() < MAX_PENDING; i++) {
@@ -661,6 +738,27 @@ public final class ServerCubeWorld extends CubeWorld {
             // Buried rock far from a surface player waits until someone goes underground; so does a cube
             // whose ground is not worked out yet, for a tick or two.
             if (!watcher.deep && !near(dx, dz, NEAR) && buried(x, y, z, cap) != 0) continue;
+            // Deep water under a fast traveller waits until they slow down, and while its column is worked out.
+            if (watcher.seaSkip && y < cy - 1 && surveys.waterOnly(x, y, z, cap) != 0) continue;
+            if (request(key, false)) limit--;
+        }
+        return limit;
+    }
+
+    /**
+     * Asks for the cubes about the point a fast traveller reaches in a few seconds (see {@link Motion#lead}), with
+     * what the cubes about them left of their share: made before they come into reach, and sent once they do. Buried
+     * rock and deep water there wait, as they would for a player standing there.
+     */
+    private void requestAhead(Watcher watcher, int cx, int cy, int cz, int h, int v, int limit, int cap) {
+        int ax = cx + watcher.leadX, az = cz + watcher.leadZ;
+        CubeOffsets offsets = CubeOffsets.of(aheadRadius(h), v, ViewOrder.sector(watcher.motion.yaw()));
+        for (int i = 0; i < offsets.size() && limit > 0 && pending.size() < MAX_PENDING; i++) {
+            int x = ax + offsets.dx(i), y = cy + offsets.dy(i), z = az + offsets.dz(i);
+            long key = CubeKey.pack(x, y, z);
+            if (cubes.containsKey(key) || pending.contains(key)) continue;
+            if (!watcher.deep && buried(x, y, z, cap) != 0) continue;
+            if (watcher.seaSkip && y < cy - 1 && surveys.waterOnly(x, y, z, cap) != 0) continue;
             if (request(key, false)) limit--;
         }
     }
@@ -697,7 +795,7 @@ public final class ServerCubeWorld extends CubeWorld {
         return watcher.player.getBlockY() < ground - (watcher.deep ? COVER / 2 : COVER);
     }
 
-    private void send(Watcher watcher, int cx, int cz, int cap) {
+    private void send(Watcher watcher, int cx, int cy, int cz, int cap) {
         int budget = SEND_CUBES_PER_TICK, standIns = 4 * SEND_CUBES_PER_TICK, bytes = Throttle.allowance(watcher.player);
         SurfaceFlight.Plan plan = watcher.plan;
         for (int i = 0; i < plan.size() && budget > 0 && bytes > 0; i++) {
@@ -707,9 +805,12 @@ public final class ServerCubeWorld extends CubeWorld {
             if (watcher.flying && buried(x, y, z, cap) == 1) continue;
             Cube cube = cubes.get(key);
             if (cube == null) {
-                // Buried rock not made yet goes as a stand-in, replaced by the real cube once it is made.
-                if (standIns <= 0 || watcher.stood.contains(key) || near(dx, dz, NEAR) || buried(x, y, z, cap) != 1) continue;
-                CubePayloads.CubeData data = new CubePayloads.CubeData(x, y, z, standIn, List.of());
+                // Buried rock not made yet goes as a stand-in, replaced by the real cube once it is made; so does deep
+                // water under a fast traveller, as plain water.
+                if (standIns <= 0 || watcher.stood.contains(key)) continue;
+                boolean water = seaStandIn(watcher, x, y, z, cy, cap);
+                if (!water && (near(dx, dz, NEAR) || buried(x, y, z, cap) != 1)) continue;
+                CubePayloads.CubeData data = new CubePayloads.CubeData(x, y, z, water ? waterStandIn : standIn, List.of());
                 Platform.INSTANCE.sendToPlayer(watcher.player, data);
                 watcher.stood.add(key);
                 bytes -= data.size();
@@ -828,31 +929,50 @@ public final class ServerCubeWorld extends CubeWorld {
         }
     }
 
-    private boolean watched(long key, int h, int v) { return watched(key, h, v, false); }
-
-    /** {@code edited} cubes stay while near anyone, buried or not, and once saved are never stood in for. */
-    private boolean watched(long key, int h, int v, boolean edited) {
-        int x = CubeKey.x(key), y = CubeKey.y(key), z = CubeKey.z(key);
+    /**
+     * The watchers by where they are, and where the cubes ahead of a fast one are made, in squares {@code reach} cube
+     * columns across: a cube is asked about only to the watchers near it (see {@link PlayerGrid}).
+     */
+    private PlayerGrid<Watcher> watcherGrid(int reach) {
+        PlayerGrid<Watcher> grid = new PlayerGrid<>(reach);
         for (Watcher watcher : watchers.values()) {
-            if (watcher.flying && watcher.surface.contains(key)) return true;
-            int dx = x - (watcher.player.getBlockX() >> 4), dz = z - (watcher.player.getBlockZ() >> 4);
-            // A glider's sky builds stay a little past where they are sent, so one is not read again on each pass.
-            if (y >= SKY_CUBE && CubeOffsets.within(dx, y - (watcher.player.getBlockY() >> 4), dz, SKY_REACH + 2, SKY_REACH_V + 2)
-                    && JetStream.aboveTerrain(watcher.player)) return true;
-            if (!CubeOffsets.within(dx, y - (watcher.player.getBlockY() >> 4), dz, h, v)) continue;
-            // Buried rock a surface player has walked away from goes, a little past where it would be made.
-            if (watcher.deep || edited || !watcher.flying && near(dx, dz, NEAR + 2)
-                    || buried(x, y, z, SurfaceFlight.surveyCap(watcher.flying, false)) != 1) return true;
+            int x = watcher.player.getBlockX() >> 4, z = watcher.player.getBlockZ() >> 4;
+            grid.add(x, z, watcher);
+            if (watcher.leading()) grid.add(x + watcher.leadX, z + watcher.leadZ, watcher);
         }
-        return false;
+        return grid;
     }
 
-    private boolean columnWatched(long column, int h) {
-        int x = CubeKey.columnX(column), z = CubeKey.columnZ(column);
-        for (Watcher watcher : watchers.values()) {
-            if (CubeOffsets.within(x - (watcher.player.getBlockX() >> 4), 0, z - (watcher.player.getBlockZ() >> 4), h, 0)) return true;
+    /** The reach of {@link #watchedBy} in cube columns across: the band, a glider's sky builds, or the cubes ahead of a traveller. */
+    private static int watchReach(int h) {
+        return Math.max(h, Math.max(SKY_REACH + 2, leadMost(h - 2) + aheadRadius(h - 2) + 2));
+    }
+
+    /** {@code edited} cubes stay while near anyone, buried or not, and once saved are never stood in for. */
+    private boolean watched(long key, int h, int v, boolean edited, PlayerGrid<Watcher> grid) {
+        int x = CubeKey.x(key), y = CubeKey.y(key), z = CubeKey.z(key);
+        return grid.any(x, z, watcher -> watchedBy(watcher, key, x, y, z, h, v, edited));
+    }
+
+    private boolean watchedBy(Watcher watcher, long key, int x, int y, int z, int h, int v, boolean edited) {
+        if (watcher.flying && watcher.surface.contains(key)) return true;
+        int dx = x - (watcher.player.getBlockX() >> 4), dy = y - (watcher.player.getBlockY() >> 4), dz = z - (watcher.player.getBlockZ() >> 4);
+        // A glider's sky builds stay a little past where they are sent, so one is not read again on each pass.
+        if (y >= SKY_CUBE && CubeOffsets.within(dx, dy, dz, SKY_REACH + 2, SKY_REACH_V + 2)
+                && JetStream.aboveTerrain(watcher.player)) return true;
+        int cap = SurfaceFlight.surveyCap(watcher.flying, false);
+        if (CubeOffsets.within(dx, dy, dz, h, v)) {
+            // Buried rock a surface player has walked away from goes, a little past where it would be made.
+            if (watcher.deep || edited || !watcher.flying && near(dx, dz, NEAR + 2) || buried(x, y, z, cap) != 1) return true;
         }
-        return false;
+        // Cubes made ahead of a fast traveller stay until they are reached, a little past where they are asked for.
+        return watcher.leading() && CubeOffsets.within(dx - watcher.leadX, dy, dz - watcher.leadZ, aheadRadius(h - 2) + 2, v)
+                && (watcher.deep || edited || buried(x, y, z, cap) != 1);
+    }
+
+    private static boolean columnWatched(long column, int h, PlayerGrid<Watcher> grid) {
+        int x = CubeKey.columnX(column), z = CubeKey.columnZ(column);
+        return grid.any(x, z, watcher -> CubeOffsets.within(x - (watcher.player.getBlockX() >> 4), 0, z - (watcher.player.getBlockZ() >> 4), h, 0));
     }
 
     private void unloadUnwatched(int h, int v) {
@@ -863,7 +983,8 @@ public final class ServerCubeWorld extends CubeWorld {
 
     private void unload(int h, int v) {
         List<Cube> drop = new ArrayList<>();
-        for (Cube cube : cubes.values()) if (!watched(cube.key, h, v, cube.edited)) drop.add(cube);
+        PlayerGrid<Watcher> near = watcherGrid(watchReach(h));
+        for (Cube cube : cubes.values()) if (!watched(cube.key, h, v, cube.edited, near)) drop.add(cube);
         if (drop.isEmpty()) return;
         for (Cube cube : drop) {
             store(cube);
@@ -871,8 +992,9 @@ public final class ServerCubeWorld extends CubeWorld {
             ((io.earthplatform.minecraft.cubic.CubicPoiStore) server.getPoiManager()).earthplatform$forget(SectionPos.asLong(cube.x, cube.y, cube.z));
         }
         // Keep sky tops near players only; far columns are rebuilt from the generator and cubes.
-        tops.long2ObjectEntrySet().removeIf(entry -> !columnWatched(entry.getLongKey(), h * 3));
-        surveys.prune(column -> columnWatched(column, h * 3));
+        PlayerGrid<Watcher> wide = watcherGrid(h * 3);
+        tops.long2ObjectEntrySet().removeIf(entry -> !columnWatched(entry.getLongKey(), h * 3, wide));
+        surveys.prune(column -> columnWatched(column, h * 3, wide));
         long start = System.nanoTime();
         storage.flushLater();
         Timings.CUBE_FLUSH.since(start);
@@ -883,9 +1005,10 @@ public final class ServerCubeWorld extends CubeWorld {
         if (speed <= 0 || watchers.isEmpty()) return;
         RandomSource random = server.getRandom();
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        boolean[] heights = watchedHeights(v);
         for (Cube cube : cubes.values()) {
-            if (!cube.section.isRandomlyTicking() || !server.shouldTickBlocksAt(ChunkPos.asLong(cube.x, cube.z))) continue;
-            if (!watchedVertically(cube.y, v)) continue;
+            if (!cube.section.isRandomlyTicking() || !heights[cube.y - (CubeWorld.MIN_Y >> 4)]) continue;
+            if (!server.shouldTickBlocksAt(ChunkPos.asLong(cube.x, cube.z))) continue;
             int x0 = cube.x << 4, y0 = cube.y << 4, z0 = cube.z << 4;
             for (int i = 0; i < speed; i++) {
                 int bx = random.nextInt(16), by = random.nextInt(16), bz = random.nextInt(16);
@@ -898,9 +1021,18 @@ public final class ServerCubeWorld extends CubeWorld {
         }
     }
 
-    private boolean watchedVertically(int cubeY, int v) {
-        for (Watcher watcher : watchers.values()) if (Math.abs(cubeY - (watcher.player.getBlockY() >> 4)) <= v) return true;
-        return false;
+    /**
+     * Which cube Ys lie within {@code v} of some player, from the lowest cube up: worked out once a tick, where asking
+     * every player about every loaded cube cost a hundred players' server millions of checks a tick.
+     */
+    private boolean[] watchedHeights(int v) {
+        int bottom = CubeWorld.MIN_Y >> 4;
+        boolean[] heights = new boolean[(CubeWorld.MAX_Y >> 4) - bottom + 1];
+        for (Watcher watcher : watchers.values()) {
+            int cy = watcher.player.getBlockY() >> 4;
+            for (int y = Math.max(0, cy - v - bottom), top = Math.min(heights.length - 1, cy + v - bottom); y <= top; y++) heights[y] = true;
+        }
+        return heights;
     }
 
     // Spawning -----------------------------------------------------------------------------------
@@ -1114,6 +1246,7 @@ public final class ServerCubeWorld extends CubeWorld {
         catch (IOException failure) { EarthPlatformMod.LOGGER.error("Could not write cube regions", failure); }
         closed = true;
         surveys.close();
+        prefetch.close();
         workers.shutdownNow();
         far.close();
         for (Cube cube : new ArrayList<>(cubes.values())) forget(cube);
@@ -1123,7 +1256,15 @@ public final class ServerCubeWorld extends CubeWorld {
         int standing = 0;
         for (Watcher watcher : watchers.values()) standing += watcher.stood.size();
         return generator.id() + ", " + cubes.size() + " cubes loaded, " + standing + " buried cubes stood in for, " + surveys.opened() + " opened by caves, " + pending.size() + " pending (" + generated + " made, " + dropped + " dropped as no longer wanted), " + light.size() + " lit, "
-                + watchers.size() + " watching, " + far.cached() + " far columns cached, " + far.stored() + ", " + far.made() + ", " + far.builds() + (failures > 0 ? ", " + failures + " generation failures" : "");
+                + watchers.size() + " watching (" + fastWatchers() + " travelling fast), " + prefetch.describe() + ", "
+                + serverLoads.sum() + " cubes made on the server thread" + (serverLoads.sum() > 0 ? String.format(java.util.Locale.ROOT, " (%.1f ms each)", serverLoadNanos.sum() / 1e6 / serverLoads.sum()) : "") + ", "
+                + far.cached() + " far columns cached, " + far.stored() + ", " + far.made() + ", " + far.builds() + (failures > 0 ? ", " + failures + " generation failures" : "");
+    }
+
+    private int fastWatchers() {
+        int fast = 0;
+        for (Watcher watcher : watchers.values()) if (watcher.motion.fast()) fast++;
+        return fast;
     }
 
     /** Iterates loaded cubes; exposed for diagnostics. */

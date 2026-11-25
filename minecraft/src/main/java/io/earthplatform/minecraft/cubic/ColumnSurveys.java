@@ -35,6 +35,8 @@ final class ColumnSurveys {
     private final int savedFrom;
     private final Long2IntOpenHashMap lows = new Long2IntOpenHashMap();
     private final Long2IntOpenHashMap surfaceLows = new Long2IntOpenHashMap(), surfaceHighs = new Long2IntOpenHashMap();
+    /** Each surveyed column's {@link ColumnSurvey#waterGap}. */
+    private final Long2LongOpenHashMap gaps = new Long2LongOpenHashMap();
     /** With surface flight on, failed columns: the tries so far over the tick the next may go. */
     private final Long2LongOpenHashMap failed = new Long2LongOpenHashMap();
     private final LongOpenHashSet pending = new LongOpenHashSet();
@@ -63,6 +65,7 @@ final class ColumnSurveys {
             long column = result[0];
             pending.remove(column);
             lows.put(column, (int) result[1]);
+            gaps.put(column, ColumnSurvey.failed(result) ? ColumnSurvey.NO_GAP : result[ColumnSurvey.gapAt(surfaces)]);
             if (surfaces) {
                 if (ColumnSurvey.failed(result)) failedAgain(column);
                 else {
@@ -144,6 +147,21 @@ final class ColumnSurveys {
         }
     }
 
+    /**
+     * 1 when a cube holds nothing but water (see {@link ColumnSurvey#waterGap}) and was never saved, 0 when not, -1
+     * while its column is being worked out, which this asks for while fewer than {@code cap} surveys are in flight.
+     */
+    int waterOnly(int x, int y, int z, int cap) {
+        if (allBuried) return 0;
+        if (!kept.isEmpty() && kept.contains(CubeKey.pack(x, y, z))) return 0;
+        long column = CubeKey.column(x, z);
+        if (!gaps.containsKey(column)) {
+            lowest(x, z, cap);
+            return -1;
+        }
+        return ColumnSurvey.inGap(gaps.get(column), y) ? 1 : 0;
+    }
+
     /** A saved buried cube comes back from the save from now on. */
     void keep(long key) { kept.add(key); }
 
@@ -160,6 +178,7 @@ final class ColumnSurveys {
     /** Forgets the columns {@code keep} turns down, with the kept and opened cubes in them. */
     void prune(LongPredicate keep) {
         lows.long2IntEntrySet().removeIf(entry -> !keep.test(entry.getLongKey()));
+        gaps.long2LongEntrySet().removeIf(entry -> !keep.test(entry.getLongKey()));
         if (surfaces) {
             surfaceLows.long2IntEntrySet().removeIf(entry -> !keep.test(entry.getLongKey()));
             surfaceHighs.long2IntEntrySet().removeIf(entry -> !keep.test(entry.getLongKey()));
