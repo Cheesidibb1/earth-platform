@@ -1,5 +1,7 @@
 package io.earthplatform.minecraft.cubic.earth;
 
+import io.earthplatform.geography.GeoPoint;
+import io.earthplatform.geography.globe.GlobeProjection;
 import io.earthplatform.geography.globe.GroundPalette;
 import io.earthplatform.geography.globe.ImagerySource;
 import io.earthplatform.geography.globe.MercatorGrid;
@@ -33,14 +35,17 @@ final class ImageryGround {
     }
 
     private final ImagerySource imagery;
-    private final MercatorGrid grid;
+    private final GlobeProjection grid;
+    private final MercatorGrid mercator;
     private final double blocksPerPixel;
     private final SimplexNoise warpX, warpZ, blend;
 
-    ImageryGround(ImagerySource imagery, MercatorGrid grid, long seed) {
+    ImageryGround(ImagerySource imagery, GlobeProjection grid, long seed) {
         this.imagery = imagery;
         this.grid = grid;
-        this.blocksPerPixel = grid.blocksPerPixel(ImagerySource.MAX_ZOOM);
+        this.mercator = grid instanceof MercatorGrid m ? m : null;
+        this.blocksPerPixel = mercator != null ? mercator.blocksPerPixel(ImagerySource.MAX_ZOOM)
+                : grid.worldWidthBlocks() / (256.0 * (1L << ImagerySource.MAX_ZOOM));
         LegacyRandomSource random = new LegacyRandomSource(seed ^ 0x494D41474552L);
         warpX = new SimplexNoise(random); warpZ = new SimplexNoise(random); blend = new SimplexNoise(random);
     }
@@ -58,27 +63,42 @@ final class ImageryGround {
      * @param jitter a value in [0, 1) fixed for the column
      */
     Surface apply(Surface surface, int code, int x, int z, ClimateZone zone, double steep, int voxel, double jitter) {
+        BlockState top = surface.top();
+        boolean bare = top == STONE || top == ANDESITE || top == GRAVEL || top == COARSE_DIRT || top == SAND || top == RED_SAND;
+        boolean vegetatedCover = code == WorldCoverSource.GRASSLAND || code == WorldCoverSource.CROPLAND || code == WorldCoverSource.SHRUBLAND;
+        boolean open = top == GRASS && vegetatedCover;
+        boolean wooded = top == GRASS && code == WorldCoverSource.TREE_COVER && surface.trees() > 0;
+        if (!bare && !open && !wooded) return surface;
+        return apply(surface, code, x, z, zone, steep, jitter, reading(x, z, voxel));
+    }
+
+    /** Applies a pre-read imagery sample to a column's surface. */
+    Surface apply(Surface surface, int code, int x, int z, ClimateZone zone, double steep, double jitter,
+                  @javax.annotation.Nullable GroundPalette.Reading reading) {
+        if (reading == null || reading.shadow()) return surface;
         // Where two blocks share a colour, each holds broad stretches, hundreds of blocks across, that
         // meet in drifts a few blocks wide, rather than mottling the ground block by block.
         double roll = Math.clamp(0.5 + 0.9 * blend.getValue(x / 160.0, z / 160.0) + 0.25 * blend.getValue(x / 7.0 + 31.7, z / 7.0) + 0.1 * (jitter - 0.5), 0, 0.999);
         BlockState top = surface.top();
         boolean bare = top == STONE || top == ANDESITE || top == GRAVEL || top == COARSE_DIRT || top == SAND || top == RED_SAND;
-        boolean open = top == GRASS && (code == WorldCoverSource.GRASSLAND || code == WorldCoverSource.CROPLAND || code == WorldCoverSource.SHRUBLAND);
+        boolean vegetatedCover = code == WorldCoverSource.GRASSLAND || code == WorldCoverSource.CROPLAND || code == WorldCoverSource.SHRUBLAND;
+        boolean open = top == GRASS && vegetatedCover;
         boolean wooded = top == GRASS && code == WorldCoverSource.TREE_COVER && surface.trees() > 0;
         if (!bare && !open && !wooded) return surface;
-        GroundPalette.Reading reading = reading(x, z, voxel);
-        if (reading == null || reading.shadow()) return surface;
+        boolean desert = zone == ClimateZone.HOT_DESERT || zone == ClimateZone.COLD_DESERT;
         if (bare) {
             // Plants seen in the pixel belong to its neighbours; the rock under them says nothing.
             if (reading.green()) return surface;
             // Red sands and layered rock colours belong to dry lands, hot or cold (the Sahara, the Colorado Plateau).
-            boolean arid = zone == ClimateZone.HOT_DESERT || zone == ClimateZone.HOT_STEPPE || zone == ClimateZone.TROPICAL_DRY
-                    || zone == ClimateZone.COLD_DESERT || zone == ClimateZone.COLD_STEPPE;
+            boolean arid = desert || zone == ClimateZone.HOT_STEPPE || zone == ClimateZone.TROPICAL_DRY
+                    || zone == ClimateZone.COLD_STEPPE;
             // Rock stays rock and loose ground loose, as land cover and slope chose; imagery picks which.
             boolean rock = top == STONE || top == ANDESITE;
             // Grey on sand is a road or a roof, not the ground; left alone it never draws lines across a desert.
             if (reading.grey() && (top == SAND || top == RED_SAND)) return surface;
-            GroundPalette.Ground[] set = rock ? (arid ? GroundPalette.DESERT_ROCK : GroundPalette.ROCK) : arid ? GroundPalette.DESERT_LOOSE : GroundPalette.LOOSE;
+            // Dry-season savanna and bushveld soils stay earthy loam outside true deserts rather than turning to sand.
+            GroundPalette.Ground[] set = top == COARSE_DIRT && vegetatedCover && !desert ? GroundPalette.LOAM
+                    : rock ? (arid ? GroundPalette.DESERT_ROCK : GroundPalette.ROCK) : arid ? GroundPalette.DESERT_LOOSE : GroundPalette.LOOSE;
             BlockState matched = BLOCKS[GroundPalette.match(reading, set, roll).ordinal()];
             return matched == top ? surface : with(surface, matched, surface.trees(), surface.grass(), surface.flowers());
         }
@@ -90,9 +110,12 @@ final class ImageryGround {
         }
         // Open land that looks dry and bare shows its soil, in patches as thick as the plants are thin.
         // Grey pixels there are roads, roofs and car parks, which stay grass rather than drawing lines.
+        // Outside true deserts, dry-season savanna and bushveld show earthy soil and keep their trees rather
+        // than turning into treeless desert sand.
         if (vegetation < 0.25 && reading.lightness() > 42 && !reading.grey() && roll > vegetation * 3) {
-            BlockState soil = BLOCKS[GroundPalette.match(reading, GroundPalette.SOIL, roll).ordinal()];
-            return with(surface, soil, 0, 0, 0);
+            GroundPalette.Ground[] set = desert ? GroundPalette.SOIL : GroundPalette.LOAM;
+            BlockState soil = BLOCKS[GroundPalette.match(reading, set, roll).ordinal()];
+            return desert ? with(surface, soil, 0, 0, 0) : with(surface, soil, surface.trees(), surface.grass() / 2, 0);
         }
         return surface;
     }
@@ -104,7 +127,16 @@ final class ImageryGround {
      */
     GroundPalette.Reading reading(int x, int z, int voxel) {
         int zoom = zoom(voxel);
-        double px = grid.pixelX(x + 0.5, zoom), py = grid.pixelY(z + 0.5, zoom);
+        double px, py;
+        if (mercator != null) {
+            px = mercator.pixelX(x + 0.5, zoom);
+            py = mercator.pixelY(z + 0.5, zoom);
+        } else {
+            GeoPoint point = grid.tryGeographic(x + 0.5, z + 0.5);
+            if (point == null || Math.abs(point.latitude()) > MercatorGrid.MAX_LATITUDE) return null;
+            px = MercatorGrid.UNIT.pixelX(MercatorGrid.UNIT.blockX(point), zoom);
+            py = MercatorGrid.UNIT.pixelY(MercatorGrid.UNIT.blockZ(point), zoom);
+        }
         if (zoom == ImagerySource.MAX_ZOOM && voxel < blocksPerPixel) {
             double nx = x / (2.2 * blocksPerPixel), nz = z / (2.2 * blocksPerPixel);
             px += 0.6 * (warpX.getValue(nx, nz) + 0.5 * warpX.getValue(3 * nx, 3 * nz));

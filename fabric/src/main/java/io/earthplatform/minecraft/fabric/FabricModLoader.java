@@ -14,7 +14,14 @@ import net.fabricmc.loader.api.ModContainer;
 public final class FabricModLoader implements Loader {
     @Override public String name() { return "fabric"; }
 
+    @Override public String version() {
+        return FabricLoader.getInstance().getModContainer("fabricloader")
+                .map(mod -> mod.getMetadata().getVersion().getFriendlyString()).orElse("unknown");
+    }
+
     @Override public boolean isModLoaded(String modId) { return FabricLoader.getInstance().isModLoaded(modId); }
+
+    @Override public boolean hasMod(String modId) { return FabricLoader.getInstance().isModLoaded(modId); }
 
     @Override public boolean hasClass(String className) {
         String path = className.replace('.', '/') + ".class";
@@ -22,6 +29,14 @@ public final class FabricModLoader implements Loader {
             if (mod.findPath(path).isPresent()) return true;
         ClassLoader loader = Thread.currentThread().getContextClassLoader();
         return loader != null && loader.getResource(path) != null;
+    }
+
+    @Override public String runtimeClassName(String intermediary, String mojang) {
+        return FabricLoader.getInstance().getMappingResolver().mapClassName("intermediary", intermediary);
+    }
+
+    @Override public String runtimeMethodName(String intermediaryOwner, String intermediaryName, String intermediaryDesc, String mojang) {
+        return FabricLoader.getInstance().getMappingResolver().mapMethodName("intermediary", intermediaryOwner, intermediaryName, intermediaryDesc);
     }
 
     @Override public Path gameDir() { return FabricLoader.getInstance().getGameDir(); }

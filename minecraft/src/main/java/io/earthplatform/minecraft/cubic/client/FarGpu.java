@@ -87,10 +87,17 @@ final class FarGpu {
     /** The vanilla three in far terrain's own finer depth, testing the game's blocks by hand (see {@link FarShaders#PRECISE_DEPTH}). */
     @Nullable private Program[] precise;
     @Nullable private boolean[] preciseFailed;
-    /** The game's projection while far terrain draws in its own finer depth (see {@link FarPlainDepth}); null otherwise. */
-    @Nullable private Matrix4f gameProjection;
+    /**
+     * The game's projection while far terrain draws in its own finer depth (see {@link FarPlainDepth}); null otherwise. With
+     * the inverse of the projection it draws in and the game's depth buffer's fixed-point range, which its test against the
+     * game's blocks shares with the merge (see {@link FarLodShaders#FAR_AS_GAME}).
+     */
+    @Nullable private Matrix4f gameProjection, farInverse;
+    private float gameSteps;
     /** Whether this draw bound the copy of the game's depth, to put back at its end. */
     private boolean blocksBound;
+    /** 1x1 opaque white texture bound on unit 0 for Tier 3 terrain pack shaders, which receive far terrain colour through vertex colour. */
+    private int whiteTexture;
     /** The Earth's curve and the high-altitude haze for this frame (see {@link EarthView}, {@link FarAtmosphere}). */
     private float curvature, atmosphere;
     @Nullable private FarShaders.PackPatch packSource;
@@ -153,6 +160,8 @@ final class FarGpu {
         int max = GL11C.glGetInteger(GL31C.GL_MAX_TEXTURE_BUFFER_SIZE);
         arenaQuads = Math.max(1 << 16, Math.min(ARENA_QUADS, max));
         version = glslVersion() + (INDEXED ? "#define EARTH_INDEXED\n" : "");
+        if (version.startsWith("#version 150"))
+            EarthPlatformMod.LOGGER.info("Far terrain uses GLSL 1.50; this OpenGL context is 3.2");
     }
 
     /**
@@ -171,17 +180,51 @@ final class FarGpu {
         return text != null && text.toLowerCase(java.util.Locale.ROOT).contains("apple");
     }
 
-    /** True when this GL can draw far terrain at all (OpenGL 3.3). */
+    /**
+     * True when this GL can draw far terrain. The shaders read integer buffer textures
+     * ({@code usamplerBuffer}, {@code texelFetch}) and bit-cast look texels with {@code uintBitsToFloat},
+     * and the draw is a vertex-array multi-draw with an unsigned-integer uniform. Those are OpenGL 3.0
+     * to 3.2 features, plus {@code uintBitsToFloat}, which is GLSL 3.30 or {@code GL_ARB_shader_bit_encoding}.
+     * A Fabric window's 3.2 core context has them and does not set {@code OpenGL33}.
+     */
     static boolean supported() {
         GLCapabilities caps = GL.getCapabilities();
-        return caps.OpenGL33;
+        boolean multiDraw = (INDEXED ? caps.glMultiDrawElementsBaseVertex : caps.glMultiDrawArrays) != 0;
+        return supported(caps.glGenVertexArrays != 0, caps.glTexBuffer != 0, caps.glUniform1ui != 0, multiDraw,
+                caps.OpenGL33 || caps.GL_ARB_shader_bit_encoding);
     }
 
-    private static String glslVersion() {
+    /** The feature check behind {@link #supported()}. */
+    static boolean supported(boolean vertexArrays, boolean bufferTextures, boolean uintUniforms, boolean multiDraw, boolean bitCast) {
+        return vertexArrays && bufferTextures && uintUniforms && multiDraw && bitCast;
+    }
+
+    /** The GLSL header baked into far terrain's programs, from the current context. */
+    static String glslVersion() {
         GLCapabilities caps = GL.getCapabilities();
-        String number = caps.OpenGL46 ? "460" : caps.OpenGL45 ? "450" : caps.OpenGL44 ? "440" : caps.OpenGL43 ? "430"
-                : caps.OpenGL42 ? "420" : caps.OpenGL41 ? "410" : caps.OpenGL40 ? "400" : "330";
-        return "#version " + number + " core\n";
+        return glslVersion(caps.OpenGL46, caps.OpenGL45, caps.OpenGL44, caps.OpenGL43, caps.OpenGL42, caps.OpenGL41, caps.OpenGL40, caps.OpenGL33,
+                caps.GL_ARB_shader_bit_encoding, caps.GL_ARB_explicit_attrib_location);
+    }
+
+    /**
+     * The same header from version flags. A 3.3 or newer context keeps the version it has always had
+     * ({@code #version 330 core} through {@code 460}). A 3.2 core context rejects {@code #version 330},
+     * so the header is {@code #version 150 core}. {@code uintBitsToFloat} and {@code layout(location)}
+     * are GLSL 3.30; the shader text already uses both, and on 3.2 they compile when the driver
+     * exposes the extensions that provide them. No shader body changes for that.
+     */
+    static String glslVersion(boolean gl46, boolean gl45, boolean gl44, boolean gl43, boolean gl42, boolean gl41, boolean gl40, boolean gl33,
+            boolean bitEncoding, boolean explicitLocations) {
+        if (gl46 || gl45 || gl44 || gl43 || gl42 || gl41 || gl40 || gl33) {
+            String number = gl46 ? "460" : gl45 ? "450" : gl44 ? "440" : gl43 ? "430"
+                    : gl42 ? "420" : gl41 ? "410" : gl40 ? "400" : "330";
+            return "#version " + number + " core\n";
+        }
+        StringBuilder header = new StringBuilder("#version 150 core\n");
+        // Extensions before any shader text: a #extension line after a declaration is an error.
+        if (bitEncoding) header.append("#extension GL_ARB_shader_bit_encoding : enable\n");
+        if (explicitLocations) header.append("#extension GL_ARB_explicit_attrib_location : enable\n");
+        return header.toString();
     }
 
     long quadBytes() { return quadBytes; }
@@ -314,7 +357,7 @@ final class FarGpu {
         int atlas = Minecraft.getInstance().getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId();
         int lightmap = RenderSystem.getShaderTexture(2);
         previousActive = GlStateManager._getActiveTexture();
-        bind2d(ATLAS_UNIT, atlas, packMode);
+        bind2d(ATLAS_UNIT, program.terrain ? whiteTexture() : atlas, packMode);
         bind2d(LIGHT_UNIT, lightmap, packMode);
         blocksBound = this.ground || precise();
         if (blocksBound) bind2d(BLOCKS_UNIT, FarBlockDepth.texture(), packMode);
@@ -399,7 +442,11 @@ final class FarGpu {
             FloatBuffer matrix = stack.mallocFloat(16);
             GL20C.glUniformMatrix4fv(program.location("earth_ModelView"), false, modelView.get(matrix));
             GL20C.glUniformMatrix4fv(program.location("earth_Projection"), false, projection.get(matrix));
-            if (precise()) GL20C.glUniformMatrix4fv(program.location("earth_GameProjection"), false, gameProjection.get(matrix));
+            if (precise()) {
+                GL20C.glUniformMatrix4fv(program.location("earth_GameProjection"), false, gameProjection.get(matrix));
+                GL20C.glUniformMatrix4fv(program.location("earth_FarInverse"), false, farInverse.get(matrix));
+                GL20C.glUniform1f(program.location("earth_GameSteps"), gameSteps);
+            }
             GL20C.glUniform1fv(program.location("earth_Shade"), shade);
             if (program.dh) {
                 // What Iris sets on a pack's Distant Horizons program in place of the old built-in matrices.
@@ -412,11 +459,24 @@ final class FarGpu {
                         modelView.invert(inverse).transpose3x3(new org.joml.Matrix3f()).get(stack.mallocFloat(9)));
                 GL20C.glUniform1f(program.location("mircoOffset"), 0.01F);
                 GL20C.glUniform1f(program.location("clipDistance"), FarLod.nearReach());
+            } else if (program.terrain) {
+                // What Iris sets on a pack's vanilla terrain program in place of the old built-in matrices and chunk state.
+                Matrix4f inverse = new Matrix4f();
+                GL20C.glUniformMatrix4fv(program.location("iris_ModelViewMat"), false, modelView.get(matrix));
+                GL20C.glUniformMatrix4fv(program.location("iris_ModelViewMatInverse"), false, modelView.invert(inverse).get(matrix));
+                GL20C.glUniformMatrix4fv(program.location("iris_ProjMat"), false, projection.get(matrix));
+                GL20C.glUniformMatrix4fv(program.location("iris_ProjMatInverse"), false, projection.invert(inverse).get(matrix));
+                GL20C.glUniformMatrix3fv(program.location("iris_NormalMat"), false,
+                        modelView.invert(inverse).transpose3x3(new org.joml.Matrix3f()).get(stack.mallocFloat(9)));
+                GL20C.glUniformMatrix4fv(program.location("iris_TextureMat"), false, new Matrix4f().get(matrix));
+                GL20C.glUniform3f(program.location("iris_ChunkOffset"), 0.0F, 0.0F, 0.0F);
+                GL20C.glUniform1f(program.location("iris_currentAlphaTest"), 0.0F);
             }
         }
-        int bx = (int) Math.floor(camera.x), by = (int) Math.floor(camera.y), bz = (int) Math.floor(camera.z);
+        int bx = CameraSpace.block(camera.x), by = CameraSpace.block(camera.y), bz = CameraSpace.block(camera.z);
         GL20C.glUniform3i(program.location("earth_CameraBlock"), bx, by, bz);
-        GL20C.glUniform3f(program.location("earth_CameraFraction"), (float) (camera.x - bx), (float) (camera.y - by), (float) (camera.z - bz));
+        GL20C.glUniform3f(program.location("earth_CameraFraction"),
+                CameraSpace.fraction(camera.x, bx), CameraSpace.fraction(camera.y, by), CameraSpace.fraction(camera.z, bz));
         GL20C.glUniform1f(program.location("earth_Grow"), grow(projection));
         if (EarthView.ENABLED) GL20C.glUniform1f(program.location("earth_Curvature"), curvature);
         if (FarAtmosphere.ENABLED) GL20C.glUniform1f(program.location("earth_Atmosphere"), atmosphere);
@@ -426,6 +486,7 @@ final class FarGpu {
         float[] fog = RenderSystem.getShaderFogColor(), colour = RenderSystem.getShaderColor();
         GL20C.glUniform4f(program.location("earth_FogColor"), fog[0], fog[1], fog[2], fog[3]);
         GL20C.glUniform4f(program.location("earth_ColorModulator"), colour[0], colour[1], colour[2], colour[3]);
+        if (program.terrain) GL20C.glUniform4f(program.location("iris_ColorModulator"), colour[0], colour[1], colour[2], colour[3]);
         GL20C.glUniform1i(program.location("earth_Quads"), QUAD_UNIT);
         GL20C.glUniform1i(program.location("earth_Looks"), LOOK_UNIT);
         GL20C.glUniform1i(program.location("earth_Columns"), COLUMN_UNIT);
@@ -564,7 +625,7 @@ final class FarGpu {
      */
     boolean prepassReady(@Nullable FarShaders.PackPatch patch) {
         // A pack's Distant Horizons program is its own vertex shader too, which the pre-pass can't match corner for corner.
-        if (!depthPrepass || patch == null || patch.dh() || !prepassSafe(patch) || GL11C.glIsEnabled(GL11C.GL_BLEND)) return false;
+        if (!depthPrepass || patch == null || !patch.ownDepth() || patch.dh() || !prepassSafe(patch) || GL11C.glIsEnabled(GL11C.GL_BLEND)) return false;
         boolean wasNear = near, wasGround = ground;
         int was = phase;
         near = ground = false;
@@ -927,6 +988,26 @@ final class FarGpu {
     /** After the shading pass: its culling was for that pass alone. */
     void cullDone() { if (hiddenCull != null) hiddenCull.done(); }
 
+    private int whiteTexture() {
+        if (whiteTexture != 0) return whiteTexture;
+        whiteTexture = GL11C.glGenTextures();
+        int active = GlStateManager._getActiveTexture();
+        int bound = GL11C.glGetInteger(GL11C.GL_TEXTURE_BINDING_2D);
+        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, whiteTexture);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            java.nio.ByteBuffer pixel = stack.malloc(4);
+            pixel.put((byte) 0xFF).put((byte) 0xFF).put((byte) 0xFF).put((byte) 0xFF).flip();
+            GL11C.glTexImage2D(GL11C.GL_TEXTURE_2D, 0, GL11C.GL_RGBA8, 1, 1, 0, GL11C.GL_RGBA, GL11C.GL_UNSIGNED_BYTE, pixel);
+        }
+        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST);
+        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
+        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_WRAP_S, GL13C.GL_CLAMP_TO_EDGE);
+        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_WRAP_T, GL13C.GL_CLAMP_TO_EDGE);
+        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, bound);
+        GlStateManager._activeTexture(active);
+        return whiteTexture;
+    }
+
     private void bind2d(int unit, int texture, boolean packMode) {
         GlStateManager._activeTexture(GL13C.GL_TEXTURE0 + unit);
         previous2d[unit] = GL11C.glGetInteger(GL11C.GL_TEXTURE_BINDING_2D);
@@ -1000,8 +1081,12 @@ final class FarGpu {
     /** Whether the precise program builds, which far terrain needs before it draws in its own depth. */
     boolean preciseReady() { return preciseProgram(NO_FADE) != null; }
 
-    /** Has the draws that follow use far terrain's own finer depth, against this game projection; null puts them back in the game's. */
-    void plainDepth(@Nullable Matrix4f game) { gameProjection = game; }
+    /** Has the draws that follow use far terrain's own finer depth, against this game projection; {@code null} puts them back in the game's. */
+    void plainDepth(@Nullable FarPlainDepth own) {
+        gameProjection = own == null ? null : own.gameProjection();
+        farInverse = own == null ? null : own.inverse();
+        gameSteps = own == null ? 0 : FarBlockDepth.steps();
+    }
 
     private boolean precise() { return gameProjection != null && !packMode; }
 
@@ -1077,6 +1162,25 @@ final class FarGpu {
             EarthPlatformMod.LOGGER.warn("The shader pack's Distant Horizons terrain program does not build for far terrain; using plain colors");
             // From the next frame far terrain draws as under a pack with no support for it, in the game's own depth.
             if (ShaderBlocks.IRIS) FarDhPack.failed(patch);
+        } else if (packPatched && patch.terrain()) {
+            // The pack's own solid terrain program draws into the already-bound G-buffer targets (see FarTerrainPack).
+            pack[fade] = linkPack(null, FarShaders.terrainFragment(version, patch, fade, false),
+                    "far terrain (shader pack's terrain program)", header, true, patch);
+            if (pack[fade] != null) {
+                if (fade == NO_FADE) {
+                    packJittered = false;
+                    EarthPlatformMod.LOGGER.info("Far terrain uses the shader pack's solid terrain program ({} targets)", patch.outputs());
+                }
+                return pack[fade];
+            }
+            if (fade != NO_FADE) {
+                packFailed[fade] = true;
+                EarthPlatformMod.LOGGER.warn("Far terrain's fade between levels does not build with the shader pack; levels meet without it");
+                return null;
+            }
+            packPatched = false;
+            EarthPlatformMod.LOGGER.warn("The shader pack's solid terrain program does not build for far terrain; using plain colors");
+            if (ShaderBlocks.IRIS) FarTerrainPack.failed(patch);
         } else if (packPatched) {
             pack[fade] = linkPack(jitter, FarShaders.packFragment(version, packCode(patch), ownDepth, fade), "far terrain (shader pack)", header, packSamplers);
             if (pack[fade] != null) {
@@ -1149,6 +1253,9 @@ final class FarGpu {
         packGround[fade] = packPatched && patch != null && patch.dh()
                 ? linkPack(null, FarShaders.dhFragment(version, patch, packOwnDepth, fade, true), "far terrain under the game's blocks (shader pack's Distant Horizons program)",
                         header, true, patch)
+                : packPatched && patch != null && patch.terrain()
+                ? linkPack(null, FarShaders.terrainFragment(version, patch, fade, true), "far terrain under the game's blocks (shader pack's terrain program)",
+                        header, true, patch)
                 : packPatched && patch != null
                 ? linkPack(jitter, FarShaders.packFragment(version, packCode(patch), packOwnDepth, fade, true), "far terrain under the game's blocks (shader pack)",
                         header, packSamplers)
@@ -1168,12 +1275,18 @@ final class FarGpu {
         return linkPack(jitter, fragment, name, header, samplers, null);
     }
 
-    /** The same; with {@code dh}, the vertex shader is the pack's Distant Horizons one after far terrain's own (see {@link FarShaders#dhVertex}). */
+    /** The same; with a custom vertex {@code patch} (Distant Horizons or solid terrain), the pack's own vertex shader runs after far terrain's. */
     @Nullable private Program linkPack(@Nullable String jitter, String fragment, String name, String header, boolean samplers,
-            @Nullable FarShaders.PackPatch dh) {
+            @Nullable FarShaders.PackPatch custom) {
         Program program = null;
-        if (dh != null) {
-            try { program = Program.link(FarShaders.dhVertex(header, dh), fragment, name); program.dh = true; }
+        if (custom != null && custom.dh()) {
+            try { program = Program.link(FarShaders.dhVertex(header, custom), fragment, name); program.dh = true; }
+            catch (IllegalStateException failure) {
+                EarthPlatformMod.LOGGER.warn("Could not build {}", name, failure);
+                return null;
+            }
+        } else if (custom != null && custom.terrain()) {
+            try { program = Program.link(FarShaders.terrainVertex(header, custom), fragment, name); program.terrain = true; }
             catch (IllegalStateException failure) {
                 EarthPlatformMod.LOGGER.warn("Could not build {}", name, failure);
                 return null;
@@ -1240,6 +1353,7 @@ final class FarGpu {
         if (queryCull != null) { queryCull.close(); queryCull = null; }
         GL30C.glDeleteVertexArrays(vao);
         if (indices != 0) GL15C.glDeleteBuffers(indices);
+        if (whiteTexture != 0) { GL11C.glDeleteTextures(whiteTexture); whiteTexture = 0; }
     }
 
     /** A linked program and its uniform locations. */
@@ -1251,6 +1365,8 @@ final class FarGpu {
         boolean jittered;
         /** Whether this is a pack's Distant Horizons program, which takes its matrices under Iris's names. */
         boolean dh;
+        /** Whether this is a pack's solid terrain program (see {@link FarTerrainPack}), which takes Iris's vanilla terrain uniforms. */
+        boolean terrain;
 
         private Program(int id) { this.id = id; }
 

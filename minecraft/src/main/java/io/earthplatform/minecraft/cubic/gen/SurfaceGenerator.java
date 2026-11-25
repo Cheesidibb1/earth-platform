@@ -1,5 +1,6 @@
 package io.earthplatform.minecraft.cubic.gen;
 
+import io.earthplatform.minecraft.cubic.earth.ModdedBiomes;
 import io.earthplatform.minecraft.cubic.far.Far;
 import java.util.ArrayList;
 import java.util.List;
@@ -141,8 +142,20 @@ public abstract class SurfaceGenerator implements CubeGenerator {
      */
     protected int giantForm(int x, int z) { return -1; }
 
+    /** Optional {@code {bark, furrow, leaves}} override for giant conifers (0 sequoia, 1 redwood, 2 fir), or null for vanilla blocks. */
+    @Nullable protected BlockState[] giantBlocks(int form) { return null; }
+
     /** Whether trees' bare log ends at the top of their crowns are covered with leaves; worlds made before build 70 keep vanilla's. */
     protected boolean cappedCrowns() { return false; }
+
+    /** Whether custom regional tree shapes are grown where the world chooses them, rather than vanilla shapes alone. */
+    protected boolean customTrees() { return false; }
+
+    /**
+     * A custom regional tree species to grow at (x, z) for a column whose cover chose {@code kind},
+     * or null to grow vanilla's tree for that family. Called only when {@link #customTrees()} is true.
+     */
+    @Nullable protected RegionalTrees.Species regionalTree(int x, int z, int y, Surface surface, Tree kind, long roll) { return null; }
 
     /** Whether cacti may grow naturally at a column. */
     protected boolean cacti(int x, int z) { return true; }
@@ -167,7 +180,7 @@ public abstract class SurfaceGenerator implements CubeGenerator {
      * otherwise stood as grey stone walls under a few blocks of red.
      */
     private static boolean bedrock(BlockState under) {
-        return under.is(Blocks.SANDSTONE) || under.is(Blocks.RED_SANDSTONE) || under.is(BlockTags.TERRACOTTA);
+        return ModdedBiomes.isSandstone(under) || under.is(BlockTags.TERRACOTTA);
     }
 
     // Columns ------------------------------------------------------------------------------------
@@ -237,6 +250,17 @@ public abstract class SurfaceGenerator implements CubeGenerator {
 
     /** Ground and water of columns asked about before their cube column is made, packed as ground << 32 | water. */
     private final ConcurrentHashMap<Long, java.util.concurrent.atomic.AtomicLongArray> grounds = new ConcurrentHashMap<>();
+
+    /** Drops column caches that are over the short cap. Called when memory runs short, from the watcher thread. */
+    private void shedCaches() {
+        if (!MemoryPressure.high()) return;
+        if (columns.size() > MemoryPressure.scaled(8192)) columns.clear();
+        if (grounds.size() > MemoryPressure.scaled(8192)) grounds.clear();
+        if (bases.size() > MemoryPressure.scaled(4096)) bases.clear();
+    }
+    /** Keeps {@link #shedCaches} registered for as long as this generator is alive. */
+    @SuppressWarnings("unused")
+    private final MemoryPressure.Hook pressure = MemoryPressure.keep(this::shedCaches);
     private static final long UNKNOWN = Long.MIN_VALUE;
 
     /**
@@ -331,6 +355,8 @@ public abstract class SurfaceGenerator implements CubeGenerator {
 
     /** Blocks a forest's crowns stand above the ground where trees are not drawn one by one: a voxel of the 8-block level. */
     private static final int CROWN = 8;
+    /** Solid rock kept below the lowest ground in fine far columns, so cave mouths do not immediately reach {@code vy = 0}. */
+    private static final int CAVE_DEPTH = 32;
 
     private void farColumn(int level, int columnX, int columnZ, FarColumn out, boolean packets, boolean materialize, boolean dense, boolean preview) {
         out.packet = null;
@@ -390,7 +416,8 @@ public abstract class SurfaceGenerator implements CubeGenerator {
         if (giants) max += Sequoia.TALLEST + 1;
         else if (v <= 4) max += preview ? CROWN : Trees.TALLEST + 1;
         else if (v == 8) max += v;
-        int bottom = (min - v) >> (level + 4), highest = max >> (level + 4);
+        int depth = level <= Far.EDIT_LEVELS ? Math.max(v, CAVE_DEPTH) : v;
+        int bottom = (min - depth) >> (level + 4), highest = max >> (level + 4);
         // Columns taller than the section budget keep their top, where the view is.
         bottom = Math.max(bottom, highest - Far.MAX_SECTIONS + 1);
         int sections = highest - bottom + 1, base = bottom * width;
@@ -579,7 +606,32 @@ public abstract class SurfaceGenerator implements CubeGenerator {
 
     @Override public LevelChunkSection generate(int cx, int cy, int cz) { return generate(cx, cy, cz, new ArrayList<>(), new ArrayList<>()); }
 
-    @Override public void attach(ServerLevel level) { vanilla = new VanillaStructures(level, new StructureHost(), seed); }
+    @Override public void attach(ServerLevel level) { detached = false; vanilla = new VanillaStructures(level, new StructureHost(), seed); }
+
+    /** For tests: this generator's structures from some registries, as {@link #attach} makes them for a level. */
+    VanillaStructures attachStructures(net.minecraft.core.RegistryAccess registries, net.minecraft.world.level.levelgen.RandomState randomState) {
+        detached = false;
+        VanillaStructures made = new VanillaStructures(null, registries, randomState, true, new StructureHost(), seed);
+        vanilla = made;
+        return made;
+    }
+
+    @Override public void loaded(int cubeX, int cubeY, int cubeZ) {
+        VanillaStructures structures = vanilla;
+        if (structures != null) structures.warm(cubeX, cubeZ);
+    }
+
+    @Override public void detach() {
+        detached = true;
+        VanillaStructures structures = vanilla;
+        if (structures != null) structures.close();
+    }
+
+    /** Set when the world closes, so base cubes queued for structure layouts are not made. */
+    private volatile boolean detached;
+    /** Base cubes queued for structure layouts and not yet made, at most {@link #MOST_PREPARED}. */
+    private final java.util.concurrent.atomic.AtomicInteger preparing = new java.util.concurrent.atomic.AtomicInteger();
+    private static final int MOST_PREPARED = 4096;
 
     @Override public LevelChunkSection generate(int cx, int cy, int cz, List<CompoundTag> blockEntities, List<CompoundTag> entities) {
         LevelChunkSection section = terrain(cx, cy, cz, blockEntities, entities);
@@ -617,10 +669,33 @@ public abstract class SurfaceGenerator implements CubeGenerator {
         return structures == null ? List.of() : structures.startsAt(chunkX, chunkZ);
     }
 
+    @Override public List<net.minecraft.world.level.levelgen.structure.StructureStart> structureStarts(int chunkX, int chunkZ,
+            java.util.function.Predicate<net.minecraft.world.level.levelgen.structure.Structure> wanted) {
+        VanillaStructures structures = vanilla;
+        return structures == null ? List.of() : structures.startsAt(chunkX, chunkZ, wanted);
+    }
+
+    @Override public List<net.minecraft.world.level.levelgen.structure.StructureStart> structureStarts(int chunkX, int chunkZ,
+            java.util.function.Predicate<net.minecraft.world.level.levelgen.structure.Structure> wanted, boolean probe) {
+        VanillaStructures structures = vanilla;
+        return structures == null ? List.of() : structures.startsAt(chunkX, chunkZ, wanted, probe);
+    }
+
     @Override public @Nullable net.minecraft.world.level.levelgen.structure.StructureStart structureStart(net.minecraft.world.level.levelgen.structure.Structure structure, int chunkX, int chunkZ) {
         VanillaStructures structures = vanilla;
         return structures == null ? null : structures.startOf(structure, chunkX, chunkZ);
     }
+
+    @Override public @Nullable net.minecraft.world.level.levelgen.structure.StructureStart structureStart(net.minecraft.world.level.levelgen.structure.Structure structure, int chunkX, int chunkZ, boolean probe) {
+        VanillaStructures structures = vanilla;
+        return structures == null ? null : structures.startOf(structure, chunkX, chunkZ, probe);
+    }
+
+    @Override public boolean structuresReady(int chunkX, int chunkZ) {
+        VanillaStructures structures = vanilla;
+        return structures == null || structures.ready(chunkX, chunkZ);
+    }
+
 
     @Override public @Nullable net.minecraft.world.level.levelgen.structure.StructureStart placedStructure(net.minecraft.world.level.levelgen.structure.Structure structure, int chunkX, int chunkZ) {
         VanillaStructures structures = vanilla;
@@ -700,6 +775,11 @@ public abstract class SurfaceGenerator implements CubeGenerator {
         return surface(x, z, sample[0], sample[1], Math.abs(east - west) + Math.abs(south - north)).biome();
     }
 
+    /** Threads that make the base cubes a structure layout reads (see {@link StructureHost#prepare}). */
+    private static final java.util.concurrent.ExecutorService STRUCTURE_TERRAIN = java.util.concurrent.Executors.newFixedThreadPool(
+            Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors() - 2)),
+            io.earthplatform.geography.globe.NamedThreads.numbered("Earth structure terrain", Thread.NORM_PRIORITY - 1));
+
     /** What vanilla structure code reads of this world: the terrain before structures. */
     private final class StructureHost implements VanillaStructures.Host {
         @Override public int ground(int x, int z) { return surfaceY(x, z); }
@@ -714,6 +794,54 @@ public abstract class SurfaceGenerator implements CubeGenerator {
             Surface surface = column(x >> 4, z >> 4).surface[(z & 15) * 16 + (x & 15)];
             return depth <= 0 ? surface.top() : depth < 4 ? surface.under() : below.rock(x, y, z, below.floor(x, z));
         }
+        /**
+         * Makes the base cubes a layout is about to read on a few threads at once. Made one by one as
+         * its pieces asked, the few hundred an ancient city or a big mineshaft reads held the cube that
+         * started it for half a minute or more, and the server thread with it when that cube was loaded
+         * at once. The cubes are the same either way. Past half of what the cache keeps, the layout
+         * makes them as it reads them.
+         */
+        @Override public void prepare(it.unimi.dsi.fastutil.longs.LongCollection cubes) {
+            if (detached || cubes.size() < 2 || cubes.size() > MemoryPressure.scaled(4096) / 2) return;
+            if (preparing.addAndGet(cubes.size()) > MOST_PREPARED) { preparing.addAndGet(-cubes.size()); return; }
+            List<java.util.concurrent.CompletableFuture<?>> making = new ArrayList<>();
+            int queued = 0;
+            try {
+                for (var it = cubes.iterator(); it.hasNext(); ) {
+                    long key = it.nextLong();
+                    if (bases.containsKey(key)) continue;
+                    int cx = SectionPos.x(key), cy = SectionPos.y(key), cz = SectionPos.z(key);
+                    making.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
+                        try {
+                            if (!detached) cube(cx, cy, cz);
+                        } finally {
+                            preparing.decrementAndGet();
+                        }
+                    }, STRUCTURE_TERRAIN));
+                    queued++; // only once it is on the pool, so a refusal releases what it held
+                }
+            } finally {
+                preparing.addAndGet(queued - cubes.size());
+            }
+            // Waits a tenth of a second at a time, so a world closing is not held up behind it.
+            for (var cube : making) {
+                while (!detached) {
+                    try {
+                        cube.get(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        break;
+                    } catch (java.util.concurrent.TimeoutException waiting) {
+                        // again
+                    } catch (java.util.concurrent.ExecutionException | java.util.concurrent.CancellationException failed) {
+                        break; // the layout makes it again as it reads it, and reports what fails
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                if (detached) return;
+            }
+        }
+
         @Nullable @Override public LevelChunkSection cube(int cx, int cy, int cz) {
             Column col = column(cx, cz);
             if (cy << 4 > Math.max(col.max + 16, col.maxWater)) return null;
@@ -746,12 +874,50 @@ public abstract class SurfaceGenerator implements CubeGenerator {
         // Empty sky cubes: nothing generated, not even trees, above the tallest possible tree.
         if (y0 > Math.max(col.max + vegetation.tallest(cx, cz), col.maxWater)) { section.recalcBlockCounts(); return section; }
         double[] caveField = y0 > col.max ? null : below.caveField(x0, y0, z0);
-        int[] floor = new int[256], roof = new int[256];
+        int[] floor = new int[256], roof = new int[256], ceiling = new int[256];
         for (int lz = 0; lz < 16; lz++) for (int lx = 0; lx < 16; lx++) {
             int ci = lz * 16 + lx, gi = (lz + 1) * 18 + lx + 1, h = col.height[gi];
             floor[ci] = below.floor(x0 + lx, z0 + lz, h);
             int slope = Math.abs(col.height[gi + 1] - col.height[gi - 1]) + Math.abs(col.height[gi + 18] - col.height[gi - 18]);
             roof[ci] = below.caveRoof(x0 + lx, z0 + lz, h, col.water[gi], slope);
+            ceiling[ci] = h - roof[ci];
+        }
+        if (y0 <= col.max) {
+            int shell = Underground.CLIFF_SHELL;
+            int minNear = col.min, maxNear = col.max;
+            for (int d = -shell; d <= 15 + shell; d += 5) {
+                int p1 = surfaceY(x0 + d, z0 - shell), p2 = surfaceY(x0 + d, z0 + 15 + shell);
+                int p3 = surfaceY(x0 - shell, z0 + d), p4 = surfaceY(x0 + 15 + shell, z0 + d);
+                minNear = Math.min(minNear, Math.min(Math.min(p1, p2), Math.min(p3, p4)));
+                maxNear = Math.max(maxNear, Math.max(Math.max(p1, p2), Math.max(p3, p4)));
+            }
+            if (maxNear - minNear > 1 && y0 + 15 >= minNear - 16) {
+                int side = 16 + 2 * shell;
+                int[] near = new int[side * side];
+                for (int nz = 0; nz < side; nz++) for (int nx = 0; nx < side; nx++) {
+                    int lx = nx - shell, lz = nz - shell;
+                    near[nz * side + nx] = lx >= -1 && lx <= 16 && lz >= -1 && lz <= 16
+                            ? col.height[(lz + 1) * 18 + lx + 1]
+                            : surfaceY(x0 + lx, z0 + lz);
+                }
+                for (int lz = 0; lz < 16; lz++) for (int lx = 0; lx < 16; lx++) {
+                    int ci = lz * 16 + lx, r = roof[ci];
+                    if (r <= 0) continue;
+                    int reach = Math.min(r - 1, shell);
+                    int ox = lx + shell, oz = lz + shell, cap = near[oz * side + ox];
+                    for (int dz = -reach; dz <= reach; dz++) {
+                        int span = reach - Math.abs(dz);
+                        int row = (oz + dz) * side + ox;
+                        for (int dx = -span; dx <= span; dx++) {
+                            int dist = Math.abs(dx) + Math.abs(dz);
+                            if (dist == 0) continue;
+                            int c = near[row + dx] + dist;
+                            if (c < cap) cap = c;
+                        }
+                    }
+                    ceiling[ci] = cap - r;
+                }
+            }
         }
         for (int ly = 0; ly < 16; ly++) {
             int y = y0 + ly;
@@ -769,7 +935,7 @@ public abstract class SurfaceGenerator implements CubeGenerator {
                     if (rock != null && rock.shows(depth, col.height, gi)) state = rock.at(y);
                     else if (rock == null && depth >= 4 && bedrock(surface.under()) && Strata.Layers.face(depth, col.height, gi)) state = surface.under();
                     // Cave mouths open the top blocks only where nothing grows on them.
-                    boolean open = depth >= roof[ci] && (depth > 1 || surface.trees() == 0 && (Underground.rock(surface.top()) || surface.top() == GRAVEL));
+                    boolean open = y <= ceiling[ci] && (depth > 1 || surface.trees() == 0 && (Underground.rock(surface.top()) || surface.top() == GRAVEL));
                     if (open && state != Underground.BEDROCK && Underground.cave(caveField, lx, ly, lz)) state = Underground.cavity(y, floor[ci]);
                 }
                 if (state != AIR) section.setBlockState(lx, ly, lz, state, false);

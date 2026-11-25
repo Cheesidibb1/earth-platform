@@ -3,9 +3,14 @@ package io.earthplatform.minecraft.cubic.gen;
 import com.mojang.logging.LogUtils;
 import com.mojang.serialization.MapCodec;
 import io.earthplatform.minecraft.cubic.CubeWorld;
+import net.minecraft.world.level.levelgen.structure.structures.BuriedTreasureStructure;
 import net.minecraft.world.level.levelgen.structure.structures.OceanMonumentStructure;
+import net.minecraft.world.level.levelgen.structure.structures.OceanRuinStructure;
+import net.minecraft.world.level.levelgen.structure.structures.ShipwreckStructure;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongCollection;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.shorts.ShortArrayList;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -15,6 +20,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntBinaryOperator;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -22,6 +28,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.QuartPos;
 import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -99,6 +106,8 @@ final class VanillaStructures {
         /** Vanilla's sea level: one above the top water block of the sea. */
         int seaLevel();
         Stream<Holder<Biome>> possibleBiomes();
+        /** Makes ahead the base cubes (packed section positions) a layout is about to read. */
+        default void prepare(LongCollection cubes) {}
     }
 
     /** Structure sets placed at vanilla's fixed depths under the local floor. */
@@ -109,62 +118,157 @@ final class VanillaStructures {
     private static final int REACH = 8;
     /** How many chunks out /locate looks for structures another mod places by its own rules, which are asked chunk by chunk. */
     private static final int OWN_PLACEMENT_SEARCH = 128;
-    /** How far terrain adaptation reaches from a piece, sideways and up or down. */
-    private static final int ADAPT = 12, ADAPT_HEIGHT = 64;
+    /** How far terrain adaptation reaches from a piece: sideways, downhill fill depth, and uphill air headroom above a piece's top. */
+    static final int ADAPT = 12, ADAPT_FILL = 16, ADAPT_HEADROOM = 6;
+    /** Surface-structure terrain limits: reject cliffs and steep mountain walls while allowing gentle slopes. */
+    static final int MIN_SLOPE_SPAN = 12, MAX_PIECE_RELIEF = 16, MIN_LOCAL_SLOPE_RELIEF = 6;
+    static final double MAX_SLOPE = 0.60, MAX_LOCAL_SLOPE = 0.90;
     /** Strongholds sit on a spread grid rather than vanilla's rings around the origin, which a planet does not have. */
     private static final int STRONGHOLD_SPACING = 64, STRONGHOLD_SEPARATION = 32, STRONGHOLD_SALT = 0x53544E44;
     private static final BlockState AIR = Blocks.AIR.defaultBlockState(), WATER = Blocks.WATER.defaultBlockState(), STONE = Blocks.STONE.defaultBlockState();
 
     /**
      * A structure set and where it may start: {@code spread} is the grid of vanilla's random spread,
-     * or null for another mod's own kind of placement, which is asked chunk by chunk.
+     * or null for another mod's own kind of placement, which is asked chunk by chunk. {@code apart}
+     * keeps it away from this world's stronghold grid where its placement kept it from vanilla's rings.
      */
-    private record Kind(int index, Holder<StructureSet> set, StructurePlacement placement, @Nullable RandomSpreadStructurePlacement spread, boolean deep, boolean relative) {}
-    /** A structure start; {@code reach} covers its pieces and terrain adaptation in real coordinates. */
-    private record Start(int kind, int chunkX, int chunkZ, StructureStart start, Frame frame, BoundingBox reach) {}
+    private record Kind(int index, Holder<StructureSet> set, StructurePlacement placement, @Nullable RandomSpreadStructurePlacement spread,
+                        @Nullable StructurePlacement.ExclusionZone apart, boolean deep, boolean relative) {}
+    /**
+     * A structure start; {@code reach} covers its pieces and terrain adaptation in real coordinates.
+     * {@code low} is the lowest real height its layout may write: in a frame at vanilla's depths, down
+     * to the frame's bottom, where YUNG's stronghold legs and zombie dungeon legs reach over a void.
+     */
+    private record Start(int kind, int chunkX, int chunkZ, StructureStart start, Frame frame, BoundingBox reach, int low) {}
     /** The part of an overlay in one cube: block indices and states, block entity and entity tags. */
     private record Patch(short[] at, BlockState[] states, List<CompoundTag> blockEntities, List<CompoundTag> entities) {}
 
-    private final ServerLevel level;
+    @Nullable private final ServerLevel level;
+    private final RegistryAccess registries;
     private final Host host;
     private final long seed;
     private final RandomState randomState;
+    private final boolean generate;
     private final ChunkGeneratorStructureState state;
     private final List<Kind> kinds;
     /** Each structure's decoration step and index within it, from which vanilla seeds its placement. */
     private final Map<Structure, int[]> seeding = new HashMap<>();
-    private final ConcurrentHashMap<Long, Optional<Start>> starts = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Long, List<Start>> columns = new ConcurrentHashMap<>();
+    private final Generations<Optional<Start>> starts = new Generations<>(16384);
+    /** The starts reaching chunk columns. */
+    private final Generations<List<Start>> columns = new Generations<>(4096);
     private final ConcurrentHashMap<Long, CompletableFuture<Long2ObjectOpenHashMap<Patch>>> overlays = new ConcurrentHashMap<>();
     /** Copies of deep starts moved to real heights, for vanilla's checks of what lies inside a structure. */
-    private final ConcurrentHashMap<Long, StructureStart> realStarts = new ConcurrentHashMap<>();
+    private final Generations<StructureStart> realStarts = new Generations<>(4096);
+    /**
+     * The starts reaching chunk columns at real heights, as {@link #startsAt} answers: published by
+     * whichever thread lays the column out, so the server thread only reads them.
+     */
+    private final Generations<List<StructureStart>> known = new Generations<>(4096);
+    /**
+     * Columns and starts being laid out aside, at most {@link #MOST_QUEUED} at once. Mob spawns
+     * probing every chunk round every player, and columns loaded from the save, may fill only
+     * {@link #MOST_PROBES} of that, so lookups for one structure (a player's own) are not crowded out.
+     */
+    private final Set<Long> asked = ConcurrentHashMap.newKeySet(), askedStarts = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicInteger queued = new java.util.concurrent.atomic.AtomicInteger();
+    static final int MOST_QUEUED = 1024, MOST_PROBES = 768;
+    /** Columns whose layout for a lookup failed, by when, so they are not tried again every tick. */
+    private final ConcurrentHashMap<Long, Long> failed = new ConcurrentHashMap<>();
+    private volatile long retryNanos = 30_000_000_000L;
+    private final java.util.concurrent.atomic.AtomicBoolean lookupFailed = new java.util.concurrent.atomic.AtomicBoolean(), copyFailed = new java.util.concurrent.atomic.AtomicBoolean(),
+            startFailed = new java.util.concurrent.atomic.AtomicBoolean();
+    /** Set when the world closes: work queued for it is dropped. */
+    private volatile boolean closed;
+    /** Whether the asking thread is the server's, which never waits for starts to be laid out. */
+    private java.util.function.BooleanSupplier onServerThread;
+    private static final java.util.concurrent.ExecutorService LOOKUPS = java.util.concurrent.Executors.newFixedThreadPool(2,
+            io.earthplatform.geography.globe.NamedThreads.numbered("Earth structure lookups", Thread.NORM_PRIORITY - 1));
     @Nullable private Frame view;
 
+    /** Whether natural structure generation is enabled for a level's structure manager. */
+    static boolean shouldGenerate(@Nullable StructureManager structures) {
+        return structures == null || structures.shouldGenerateStructures();
+    }
+
     VanillaStructures(ServerLevel level, Host host, long seed) {
+        this(level, level.registryAccess(), level.getChunkSource().randomState(),
+                shouldGenerate(level.structureManager()), host, seed);
+    }
+
+    VanillaStructures(@Nullable ServerLevel level, RegistryAccess registries, RandomState randomState,
+                      boolean generate, Host host, long seed) {
         this.level = level;
+        this.registries = registries;
         this.host = host;
         this.seed = seed;
-        this.randomState = level.getChunkSource().randomState();
-        Registry<StructureSet> sets = level.registryAccess().registryOrThrow(Registries.STRUCTURE_SET);
+        this.randomState = randomState;
+        this.generate = generate;
+        this.onServerThread = level == null ? () -> false : () -> level.getServer() != null && level.getServer().isSameThread();
+        Registry<StructureSet> sets = registries.registryOrThrow(Registries.STRUCTURE_SET);
         this.state = ChunkGeneratorStructureState.createForFlat(randomState, seed, new FrameBiomes(0), sets.holders().map(h -> (Holder<StructureSet>) h));
         List<Kind> found = new ArrayList<>();
         for (Holder<StructureSet> set : state.possibleStructureSets()) {
             String id = set.unwrapKey().map(k -> k.location().toString()).orElse("");
             StructurePlacement placement = set.value().placement();
-            if (placement instanceof ConcentricRingsStructurePlacement)
-                placement = new RandomSpreadStructurePlacement(STRONGHOLD_SPACING, STRONGHOLD_SEPARATION, RandomSpreadType.TRIANGULAR, STRONGHOLD_SALT);
+            StructurePlacement.ExclusionZone apart = null;
+            if (placement instanceof ConcentricRingsStructurePlacement) placement = strongholdGrid();
+            else {
+                StructurePlacement.ExclusionZone rings = ringExclusion(placement);
+                StructurePlacement alone = rings == null ? null : withoutExclusion(placement);
+                if (alone != null) {
+                    placement = alone;
+                    apart = new StructurePlacement.ExclusionZone(
+                            Holder.direct(new StructureSet(rings.otherSet().value().structures(), strongholdGrid())), rings.chunkCount());
+                } else if (rings != null) LOGGER.warn("Cubic world: structure set {} is kept from vanilla's stronghold rings and could not be moved to this world's grid", id);
+            }
             found.add(new Kind(found.size(), set, placement, placement instanceof RandomSpreadStructurePlacement spread ? spread : null,
-                    deep(id, set.value()), FLOOR_RELATIVE.contains(id)));
+                    apart, deep(id, set.value()), FLOOR_RELATIVE.contains(id)));
         }
         this.kinds = List.copyOf(found);
         long added = found.stream().filter(k -> !k.set.unwrapKey().map(key -> key.location().getNamespace().equals("minecraft")).orElse(false)).count();
         if (added > 0) LOGGER.info("Cubic world: {} structure sets from other mods, {} placed by their own rules, {} at vanilla depths",
                 added, found.stream().filter(k -> k.spread == null).count(), found.stream().filter(k -> k.deep && !DEEP.contains(k.set.getRegisteredName())).count());
         Map<Integer, Integer> counts = new HashMap<>();
-        for (Structure structure : level.registryAccess().registryOrThrow(Registries.STRUCTURE)) {
+        for (Structure structure : registries.registryOrThrow(Registries.STRUCTURE)) {
             int step = structure.step().ordinal();
             seeding.put(structure, new int[]{step, counts.merge(step, 1, Integer::sum) - 1});
         }
+    }
+
+    /** Where strongholds may start: a spread grid, as a planet has no origin for vanilla's rings. */
+    static RandomSpreadStructurePlacement strongholdGrid() {
+        return new RandomSpreadStructurePlacement(STRONGHOLD_SPACING, STRONGHOLD_SEPARATION, RandomSpreadType.TRIANGULAR, STRONGHOLD_SALT);
+    }
+
+    /**
+     * A placement's exclusion zone when it keeps away from a set on vanilla's concentric rings
+     * (Dungeons and Taverns' shrines keep 15 chunks from strongholds), or null. Vanilla works its
+     * rings out once, searching biomes round 128 spots up to 1,300 chunks from the origin, and every
+     * check waits for that: here each of those biomes is real Earth data from far away.
+     */
+    @Nullable private StructurePlacement.ExclusionZone ringExclusion(StructurePlacement placement) {
+        var ops = net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, registries);
+        var json = StructurePlacement.CODEC.encodeStart(ops, placement).result()
+                .filter(com.google.gson.JsonElement::isJsonObject).map(com.google.gson.JsonElement::getAsJsonObject).orElse(null);
+        if (json == null || !json.has("exclusion_zone")) return null;
+        StructurePlacement.ExclusionZone zone = StructurePlacement.ExclusionZone.CODEC.parse(ops, json.get("exclusion_zone")).result().orElse(null);
+        return zone != null && zone.otherSet().isBound() && zone.otherSet().value().placement() instanceof ConcentricRingsStructurePlacement ? zone : null;
+    }
+
+    /** The same placement with no exclusion zone, or null if its codec cannot say it. */
+    @Nullable private StructurePlacement withoutExclusion(StructurePlacement placement) {
+        var ops = net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, registries);
+        var json = StructurePlacement.CODEC.encodeStart(ops, placement).result()
+                .filter(com.google.gson.JsonElement::isJsonObject).map(com.google.gson.JsonElement::getAsJsonObject).orElse(null);
+        if (json == null) return null;
+        json.remove("exclusion_zone");
+        return StructurePlacement.CODEC.parse(ops, json).result().orElse(null);
+    }
+
+    /** Whether a structure set's placement allows a start in a chunk. */
+    private boolean startsIn(Kind kind, int chunkX, int chunkZ) {
+        if (!kind.placement.isStructureChunk(state, chunkX, chunkZ)) return false;
+        return kind.apart == null || !state.hasStructureChunkInRange(kind.apart.otherSet(), chunkX, chunkZ, kind.apart.chunkCount());
     }
 
     /**
@@ -177,7 +281,7 @@ final class VanillaStructures {
     private boolean deep(String id, StructureSet set) {
         if (id.startsWith("minecraft:")) return DEEP.contains(id);
         if (set.structures().isEmpty()) return false;
-        var ops = net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, level.registryAccess());
+        var ops = net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, registries);
         for (StructureSet.StructureSelectionEntry entry : set.structures()) {
             Structure structure = entry.structure().value();
             var json = Structure.DIRECT_CODEC.encodeStart(ops, structure).result()
@@ -196,10 +300,10 @@ final class VanillaStructures {
 
     /** Copies into a cube every structure block, block entity and entity falling in it. */
     void place(LevelChunkSection section, int cx, int cy, int cz, List<CompoundTag> blockEntities, List<CompoundTag> entities) {
-        int y0 = cy << 4;
+        if (!generate) return;
         long key = SectionPos.asLong(cx, cy, cz);
         for (Start start : column(cx, cz)) {
-            if (start.reach.maxY() < y0 || start.reach.minY() > y0 + 15) continue;
+            if (!placesInto(start.low, start.reach.maxY(), cy)) continue;
             Patch patch = overlay(start).get(key);
             if (patch == null) continue;
             for (int i = 0; i < patch.at.length; i++) {
@@ -222,6 +326,7 @@ final class VanillaStructures {
      * the centre of its pieces at real heights, or null. Slow where starts are not yet known.
      */
     @Nullable BlockPos locate(java.util.function.Predicate<Structure> wanted, int x, int z, int radius) {
+        if (!generate) return null;
         int cx = x >> 4, cz = z >> 4;
         // Nearest candidate first, so only the few closest starts are laid out (eyes of ender ask on the server thread)
         List<long[]> candidates = new ArrayList<>();
@@ -232,7 +337,7 @@ final class VanillaStructures {
                 int r = Math.min(radius, OWN_PLACEMENT_SEARCH);
                 for (int qz = cz - r; qz <= cz + r; qz++) for (int qx = cx - r; qx <= cx + r; qx++) {
                     long d = (long) (qx - cx) * (qx - cx) + (long) (qz - cz) * (qz - cz);
-                    if (d <= (long) r * r && kind.placement.isStructureChunk(state, qx, qz)) candidates.add(new long[]{d, kind.index, qx, qz});
+                    if (d <= (long) r * r && startsIn(kind, qx, qz)) candidates.add(new long[]{d, kind.index, qx, qz});
                 }
                 continue;
             }
@@ -247,8 +352,10 @@ final class VanillaStructures {
         candidates.sort(java.util.Comparator.comparingLong(c -> c[0]));
         for (long[] c : candidates) {
             Kind kind = kinds.get((int) c[1]);
-            if (!kind.placement.isStructureChunk(state, (int) c[2], (int) c[3])) continue;
-            Start start = start(kind, (int) c[2], (int) c[3]);
+            if (!startsIn(kind, (int) c[2], (int) c[3])) continue;
+            Start start;
+            try { start = start(kind, (int) c[2], (int) c[3]); }
+            catch (StartFailed failed) { continue; } // asked again next time
             if (start == null || !wanted.test(start.start.getStructure())) continue;
             BlockPos centre = start.start.getBoundingBox().getCenter().above(start.frame.shift);
             // Pieces that settle onto the ground as they are placed (temples, shipwrecks) still sit at vanilla's start height here
@@ -277,20 +384,206 @@ final class VanillaStructures {
         return null;
     }
 
-    List<StructureStart> startsAt(int cx, int cz) {
-        List<Start> found = column(cx, cz);
-        if (found.isEmpty()) return List.of();
-        List<StructureStart> real = new ArrayList<>(found.size());
-        for (Start start : found) real.add(real(start));
-        return real;
+    List<StructureStart> startsAt(int cx, int cz) { return startsAt(cx, cz, null, true); }
+
+    List<StructureStart> startsAt(int cx, int cz, @Nullable Predicate<Structure> wanted) { return startsAt(cx, cz, wanted, false); }
+
+    /**
+     * The starts of wanted structures (all, if null) reaching a chunk column at real heights. Off
+     * the server thread, only the structure sets that hold a wanted structure are laid out. A
+     * {@code probe} (mob spawns asking round every player) is queued from a smaller share.
+     */
+    List<StructureStart> startsAt(int cx, int cz, @Nullable Predicate<Structure> wanted, boolean probe) {
+        if (!generate) return List.of();
+        long key = ChunkPos.asLong(cx, cz);
+        boolean server = onServerThread.getAsBoolean();
+        List<StructureStart> ready = known.get(key);
+        if (ready == null) {
+            List<Start> laid = columns.get(key); // laid out when the column's cubes generated or loaded
+            if (laid != null) ready = server ? realIfMade(laid) : real(laid);
+            if (ready != null) known.offer(key, ready); // the server thread: kept only if no other thread is writing
+        }
+        if (ready != null) return only(ready, wanted);
+        Predicate<Kind> holding = wanted == null ? kind -> true
+                : kind -> kind.set.value().structures().stream().anyMatch(e -> wanted.test(e.structure().value()));
+        if (server) {
+            // Mods ask from players' ticks which structure a player stands in (YUNG's desert temples every tick),
+            // and mob spawns ask for every chunk round every player. Laying starts out there held the server
+            // thread, behind cube workers laying out big jigsaw structures, for minutes; even walking every
+            // set's placement grid there costs seconds a tick with sets whose placement reads its config each
+            // time (Create: Structures Arise). Every generated cube lays its column out, so where a player
+            // stands is known; a column not yet laid out is laid out aside, and until then the answer is none.
+            if (!backingOff(key)) ask(asked, key, () -> startsLaidOut(cx, cz), probe);
+            return List.of();
+        }
+        try {
+            if (wanted != null && !columns.containsKey(key)) return only(real(reaching(cx, cz, holding)), wanted);
+            return only(startsLaidOut(cx, cz), wanted);
+        } catch (StartFailed failed) {
+            return List.of(); // nothing kept: asked again next time
+        }
     }
 
-    /** One structure's start in a chunk at real heights, or null. */
-    @Nullable StructureStart startOf(Structure structure, int chunkX, int chunkZ) {
+    private static List<StructureStart> only(List<StructureStart> starts, @Nullable Predicate<Structure> wanted) {
+        return wanted == null ? starts : starts.stream().filter(start -> wanted.test(start.getStructure())).toList();
+    }
+
+    private List<StructureStart> real(List<Start> starts) {
+        List<StructureStart> real = new ArrayList<>(starts.size());
+        for (Start start : starts) real.add(real(start));
+        return List.copyOf(real);
+    }
+
+    private List<StructureStart> startsLaidOut(int cx, int cz) {
+        long key = ChunkPos.asLong(cx, cz);
+        List<Start> laid = column(cx, cz);
+        List<StructureStart> ready = known.get(key);
+        if (ready == null) known.put(key, ready = real(laid));
+        failed.remove(key);
+        return ready;
+    }
+
+    /** The starts at real heights where each is already made, without making deep ones' copies here; null if one is not. */
+    @Nullable private List<StructureStart> realIfMade(List<Start> laid) {
+        List<StructureStart> real = new ArrayList<>(laid.size());
+        for (Start start : laid) {
+            StructureStart made = start.frame.shift == 0 ? start.start : realStarts.get(startKey(start.kind, start.chunkX, start.chunkZ));
+            if (made == null) return null;
+            real.add(made);
+        }
+        return List.copyOf(real);
+    }
+
+    /**
+     * A cube came from the save: its column is laid out aside, as a generated cube's is laid out,
+     * so lookups in structures there (mob spawns, YUNG's temples) find them. Never on the thread
+     * that read it: a cube worker laying it out waited on the start lock behind whatever slow start
+     * held it (an ancient city), though its cube was already made. An arrival waits for it instead
+     * (see {@link #ready}).
+     */
+    void warm(int cx, int cz) {
+        if (!generate || closed) return;
+        long key = ChunkPos.asLong(cx, cz);
+        if (known.get(key) != null || backingOff(key)) return;
+        ask(asked, key, () -> startsLaidOut(cx, cz), true);
+    }
+
+    /**
+     * Server thread, for an arrival: whether a chunk column's starts are laid out and published, so
+     * the first lookups there answer right. Until they are, asks for them aside as a lookup of its
+     * own, not a probe, so mob spawns cannot crowd it out. A column whose layout failed is asked
+     * again once its backoff ends, and is not ready meanwhile.
+     */
+    boolean ready(int cx, int cz) {
+        if (!generate || closed) return true;
+        long key = ChunkPos.asLong(cx, cz);
+        if (known.get(key) != null) return true;
+        List<Start> laid = columns.get(key);
+        List<StructureStart> real = laid == null ? null : realIfMade(laid);
+        if (real != null) {
+            known.offer(key, real);
+            return true;
+        }
+        if (!backingOff(key)) ask(asked, key, () -> startsLaidOut(cx, cz), false);
+        return false;
+    }
+
+    private boolean backingOff(long key) {
+        Long failedAt = failed.get(key);
+        return failedAt != null && System.nanoTime() - failedAt <= retryNanos;
+    }
+
+    /** For tests: how long a failed column is left before it is tried again. */
+    void retryAfter(long nanos) { retryNanos = nanos; }
+
+    private void failedAt(long key, Throwable failure) {
+        if (closed) return;
+        if (failed.size() > 4096) failed.clear();
+        failed.put(key, System.nanoTime());
+        if (lookupFailed.compareAndSet(false, true))
+            LOGGER.warn("Cubic world: laying out structures for a lookup failed; that place answers none for a while", failure);
+    }
+
+    /** How many lookups are queued or running. For tests. */
+    int queued() { return queued.get(); }
+
+    /** Whether a chunk column's starts are laid out and published. For tests. */
+    boolean laidOut(int cx, int cz) { return known.get(ChunkPos.asLong(cx, cz)) != null; }
+
+    /**
+     * Lays something out aside for the server thread, once per key and at most {@link #MOST_QUEUED}
+     * at a time, probes (and columns loaded from the save) at most {@link #MOST_PROBES}. A failure
+     * is remembered apart from what is known, and the column is not tried again for a while.
+     */
+    private void ask(Set<Long> pending, long key, Runnable work, boolean probe) {
+        if (closed) return;
+        int most = probe ? MOST_PROBES : MOST_QUEUED;
+        for (int now = queued.get(); ; now = queued.get()) { // a place is taken before anything is queued, so no share is overrun
+            if (now >= most) return;
+            if (queued.compareAndSet(now, now + 1)) break;
+        }
+        if (!pending.add(key)) {
+            queued.decrementAndGet();
+            return;
+        }
+        try {
+            LOOKUPS.execute(() -> {
+                try {
+                    if (!closed) work.run();
+                } catch (java.util.concurrent.CancellationException closing) {
+                    // the world is closing
+                } catch (RuntimeException | LinkageError failure) {
+                    if (pending != askedStarts) failedAt(key, failure);
+                } finally {
+                    pending.remove(key);
+                    queued.decrementAndGet();
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException full) {
+            pending.remove(key);
+            queued.decrementAndGet();
+        }
+    }
+
+    /** Drops the lookups queued for this world. */
+    void close() { closed = true; }
+
+    @Nullable StructureStart startOf(Structure structure, int chunkX, int chunkZ) { return startOf(structure, chunkX, chunkZ, false); }
+
+    /**
+     * One structure's start in a chunk at real heights, or null. On the server thread, only one
+     * already known (see {@link #startsAt}); one not known is laid out aside, from the probes'
+     * share when a {@code probe} asks (mob spawns following up {@code getAllStructuresAt}).
+     */
+    @Nullable StructureStart startOf(Structure structure, int chunkX, int chunkZ, boolean probe) {
+        if (!generate) return null;
+        boolean server = onServerThread.getAsBoolean();
         for (Kind kind : kinds) {
+            if (server) {
+                // A start already laid out is answered; one not yet known is laid out aside.
+                if (kind.set.value().structures().stream().noneMatch(e -> e.structure().value() == structure)) continue;
+                if (!startsIn(kind, chunkX, chunkZ)) continue;
+                long key = startKey(kind.index, chunkX, chunkZ);
+                Optional<Start> cached = starts.get(key);
+                if (cached == null) {
+                    Kind laying = kind;
+                    ask(askedStarts, key, () -> {
+                        Start made = start(laying, chunkX, chunkZ);
+                        if (made != null) real(made); // a deep start's copy too, so the next ask only reads
+                    }, probe);
+                    continue;
+                }
+                Start start = cached.orElse(null);
+                if (start == null || start.start.getStructure() != structure) continue;
+                StructureStart made = start.frame.shift == 0 ? start.start : realStarts.get(key);
+                if (made == null) ask(askedStarts, key, () -> real(start), probe); // a deep start's copy, made aside
+                return made;
+            }
             if (kind.set.value().structures().stream().noneMatch(e -> e.structure().value() == structure)) continue;
-            if (!kind.placement.isStructureChunk(state, chunkX, chunkZ)) continue;
-            Start start = start(kind, chunkX, chunkZ);
+            if (!startsIn(kind, chunkX, chunkZ)) continue;
+            Start start;
+            try { start = start(kind, chunkX, chunkZ); }
+            catch (StartFailed failed) { continue; }
             if (start != null && start.start.getStructure() == structure) return real(start);
         }
         return null;
@@ -323,16 +616,25 @@ final class VanillaStructures {
         StructureStart cached = realStarts.get(key);
         if (cached != null) return cached;
         StructureStart copy = moved(start.start, new ChunkPos(start.chunkX, start.chunkZ), start.frame.shift);
-        if (copy == null) return start.start;
-        if (realStarts.size() > 4096) realStarts.clear();
-        StructureStart raced = realStarts.putIfAbsent(key, copy);
-        return raced != null ? raced : copy;
+        return realStarts.putIfAbsent(key, copy != null ? copy : start.start); // one that cannot be copied stands as it is
     }
 
-    /** A copy of a start laid out in a frame, moved up by the frame's shift to real heights, or null. */
+    /**
+     * A copy of a start laid out in a frame, moved up by the frame's shift to real heights, or null,
+     * also where a piece (another mod's) throws as it is saved or loaded: else every ask would make
+     * the same failing copy again.
+     */
     @Nullable private StructureStart moved(StructureStart start, ChunkPos chunk, int shift) {
-        StructurePieceSerializationContext context = StructurePieceSerializationContext.fromLevel(level);
-        StructureStart copy = StructureStart.loadStaticStart(context, start.createTag(context, chunk), seed);
+        StructureStart copy;
+        try {
+            StructurePieceSerializationContext context = StructurePieceSerializationContext.fromLevel(level);
+            copy = StructureStart.loadStaticStart(context, start.createTag(context, chunk), seed);
+        } catch (RuntimeException | LinkageError failure) {
+            if (copyFailed.compareAndSet(false, true))
+                LOGGER.warn("Cubic world: a start of {} could not be copied to real heights; lookups see it at its layout's depth",
+                        registries.registryOrThrow(Registries.STRUCTURE).getKey(start.getStructure()), failure);
+            return null;
+        }
         if (copy == null || !copy.isValid()) return null;
         for (StructurePiece piece : copy.getPieces()) piece.move(0, shift, 0);
         return copy;
@@ -352,12 +654,15 @@ final class VanillaStructures {
         Frame frame = new Frame(deep || relative ? host.floor(chunk.getMiddleBlockX(), chunk.getMiddleBlockZ()) - 64 : 0, deep);
         StructureStart made;
         synchronized (STARTS) {
-            made = structure.generate(level.registryAccess(), frame, frame.getBiomeSource(), randomState, level.getStructureManager(),
+            made = structure.generate(registries, frame, frame.getBiomeSource(), randomState, level == null ? null : level.getStructureManager(),
                     seed, chunk, 0, frame.heights, biome -> true);
         }
         if (!made.isValid()) return null;
         return frame.shift == 0 ? made : moved(made, chunk, frame.shift);
     }
+
+    /** For tests: which thread counts as the server's. */
+    void serverThread(java.util.function.BooleanSupplier onServerThread) { this.onServerThread = onServerThread; }
 
     /** The chunk generator vanilla structure code sees this world through, at real heights. */
     ChunkGenerator view() {
@@ -375,11 +680,11 @@ final class VanillaStructures {
             int blocks = 0, entities = 0;
             for (Patch patch : overlay.values()) { blocks += patch.at.length; entities += patch.entities.size(); }
             Patch here = overlay.get(cube);
-            text.append(level.registryAccess().registryOrThrow(Registries.STRUCTURE).getKey(start.start.getStructure()))
+            text.append(registries.registryOrThrow(Registries.STRUCTURE).getKey(start.start.getStructure()))
                     .append(" box ").append(start.start.getBoundingBox().moved(0, start.frame.shift, 0))
                     .append(": ").append(blocks).append(" blocks, ").append(entities).append(" entities, ")
                     .append(here == null ? 0 : here.at.length).append(" here, by cube y in this column:");
-            for (int cy = (start.reach.minY() >> 4); cy <= (start.reach.maxY() >> 4); cy++) {
+            for (int cy = (start.low >> 4); cy <= (start.reach.maxY() >> 4); cy++) {
                 Patch p = overlay.get(SectionPos.asLong(x >> 4, cy, z >> 4));
                 if (p != null) text.append(' ').append(cy).append('=').append(p.at.length);
             }
@@ -412,15 +717,26 @@ final class VanillaStructures {
 
     /** The starts reaching a chunk column, in a fixed order. */
     private List<Start> column(int cx, int cz) {
+        if (!generate) return List.of();
         long key = ChunkPos.asLong(cx, cz);
         List<Start> cached = columns.get(key);
         if (cached != null) return cached;
+        List<Start> made = columns.putIfAbsent(key, reaching(cx, cz, kind -> true));
+        // At real heights too, made here (deep starts' copies take a few milliseconds), so the server thread only reads them.
+        if (known.get(key) == null) known.put(key, real(made));
+        return made;
+    }
+
+    /** The starts of some structure sets reaching a chunk column, in a fixed order. */
+    private List<Start> reaching(int cx, int cz, Predicate<Kind> which) {
         List<Start> found = new ArrayList<>();
         int x0 = cx << 4, z0 = cz << 4;
         for (Kind kind : kinds) {
+            if (closed) throw new java.util.concurrent.CancellationException("cubic world closed"); // nothing half laid out is kept
+            if (!which.test(kind)) continue;
             if (kind.spread == null) {
                 for (int z = cz - REACH; z <= cz + REACH; z++) for (int x = cx - REACH; x <= cx + REACH; x++) {
-                    if (!kind.placement.isStructureChunk(state, x, z)) continue;
+                    if (!startsIn(kind, x, z)) continue;
                     Start start = start(kind, x, z);
                     if (start != null && start.reach.intersects(x0, z0, x0 + 15, z0 + 15)) found.add(start);
                 }
@@ -431,30 +747,55 @@ final class VanillaStructures {
                 for (int rx = Math.floorDiv(cx - REACH, spacing); rx <= Math.floorDiv(cx + REACH, spacing); rx++) {
                     ChunkPos chunk = kind.spread.getPotentialStructureChunk(seed, rx * spacing, rz * spacing);
                     if (Math.abs(chunk.x - cx) > REACH || Math.abs(chunk.z - cz) > REACH) continue;
-                    if (!kind.placement.isStructureChunk(state, chunk.x, chunk.z)) continue;
+                    if (!startsIn(kind, chunk.x, chunk.z)) continue;
                     Start start = start(kind, chunk.x, chunk.z);
                     if (start != null && start.reach.intersects(x0, z0, x0 + 15, z0 + 15)) found.add(start);
                 }
         }
-        List<Start> made = List.copyOf(found);
-        if (columns.size() > 4096) columns.clear();
-        columns.putIfAbsent(key, made);
-        return made;
+        return List.copyOf(found);
     }
 
+    /**
+     * A structure set's start in a chunk, or null where it has none. A start that throws is not
+     * taken for none: the layout asking fails (a lookup's column backs off, a cube is made again
+     * later), as the failure may pass (map data still coming). It is not tried again for a while,
+     * and a try counts once however many callers ask meanwhile, so one short outage is one try. Only
+     * after {@link #MOST_START_FAILURES} tries is it given up and left out, so another mod's start
+     * that always throws leaves no hole.
+     */
     @Nullable private Start start(Kind kind, int chunkX, int chunkZ) {
         long key = startKey(kind.index, chunkX, chunkZ);
         Optional<Start> cached = starts.get(key);
         if (cached != null) return cached.orElse(null);
+        StartFailure recent = startFailures.get(key);
+        if (recent != null && System.nanoTime() - recent.at < startRetryNanos) throw new StartFailed(null); // inside its backoff: not tried
         Start made = null;
         try {
             made = makeStart(kind, chunkX, chunkZ);
+        } catch (java.util.concurrent.CancellationException closing) {
+            throw closing; // the world is closing: not known to be missing
         } catch (RuntimeException e) {
-            LOGGER.warn("Cubic world: structure set {} failed to start in chunk {}, {}", kind.set.getRegisteredName(), chunkX, chunkZ, e);
+            long now = System.nanoTime();
+            // Callers failing together in one window (generation and lookups, one outage) count as one try.
+            int tries = startFailures.compute(key, (k, had) -> had != null && now - had.at < startRetryNanos ? had
+                    : new StartFailure(had == null ? 1 : had.tries + 1, now)).tries;
+            if (tries < MOST_START_FAILURES) {
+                if (startFailures.size() > 4096) startFailures.clear();
+                if (startFailed.compareAndSet(false, true))
+                    LOGGER.warn("Cubic world: structure set {} failed to start in chunk {}, {}; asked again later (logged once)",
+                            kind.set.getRegisteredName(), chunkX, chunkZ, e);
+                throw new StartFailed(e);
+            }
+            LOGGER.warn("Cubic world: structure set {} failed to start in chunk {}, {} {} times; left out",
+                    kind.set.getRegisteredName(), chunkX, chunkZ, tries, e);
         }
-        if (starts.size() > 16384) starts.clear();
-        starts.putIfAbsent(key, Optional.ofNullable(made));
-        return made;
+        startFailures.remove(key);
+        return starts.putIfAbsent(key, Optional.ofNullable(made)).orElse(null);
+    }
+
+    /** A start that threw, not yet given up: whatever asked fails, and is asked again later. */
+    static final class StartFailed extends RuntimeException {
+        StartFailed(Throwable cause) { super(cause); }
     }
 
     @Nullable private Start makeStart(Kind kind, int chunkX, int chunkZ) {
@@ -485,9 +826,11 @@ final class VanillaStructures {
             }
         }
         if (!made.isValid()) return null;
-        if (made.getStructure() instanceof OceanMonumentStructure && !monumentFloor(made.getBoundingBox())) return null;
+        if (made.getStructure() instanceof OceanMonumentStructure) {
+            if (!monumentFloor(made.getBoundingBox())) return null;
+        } else if (!surfaceGroundFits(kind, made, frame.shift)) return null;
         BoundingBox box = made.getBoundingBox().moved(0, frame.shift, 0);
-        if (made.getStructure().terrainAdaptation() != TerrainAdjustment.NONE) box = box.inflatedBy(ADAPT, ADAPT_HEIGHT, ADAPT);
+        if (made.getStructure().terrainAdaptation() != TerrainAdjustment.NONE) box = box.inflatedBy(ADAPT, ADAPT_FILL + 4, ADAPT);
         else box = box.inflatedBy(4, 4, 4); // features in pieces (trees) reach a little past them
         if (frame.shift == 0) {
             // Temples, huts, igloos, shipwrecks and ocean ruins drop onto the ground only as they are placed
@@ -499,7 +842,22 @@ final class VanillaStructures {
                 }
             box = new BoundingBox(box.minX(), Math.min(box.minY(), low - 48), box.minZ(), box.maxX(), Math.max(box.maxY(), high + 32), box.maxZ());
         }
-        return new Start(kind.index, chunkX, chunkZ, made, frame, box);
+        return new Start(kind.index, chunkX, chunkZ, made, frame, box, lowestWrite(box.minY(), frame.minY, frame.shift));
+    }
+
+    /**
+     * The lowest real height a layout may write. A frame at vanilla's depths ends at its
+     * {@code frameMinY} (even where the local floor lies at vanilla's Y 64, so the frame is not
+     * shifted), and processors extend legs down to it over a void: placed down there too, or the
+     * legs stop in mid-air at the reach of the pieces. A surface frame reaches the world's bottom.
+     */
+    static int lowestWrite(int reachMinY, int frameMinY, int shift) {
+        return frameMinY > CubeWorld.MIN_Y ? Math.min(reachMinY, frameMinY + shift) : reachMinY;
+    }
+
+    /** Whether a layout writing from {@code low} up to {@code top} (real heights) can write in cubes at {@code cy}. */
+    static boolean placesInto(int low, int top, int cy) {
+        return top >= cy << 4 && low <= (cy << 4) + 15;
     }
 
     /**
@@ -518,7 +876,98 @@ final class VanillaStructures {
 
     private static final int MONUMENT_DEPTH_MIN = 25, MONUMENT_DEPTH_MAX = 75;
 
+    /**
+     * Whether a surface structure sits on gentle enough ground, rejecting cliffs and steep mountain
+     * walls where buildings would jut out of rock or carve deep trenches. Underground and underwater
+     * structures are left alone.
+     */
+    private boolean surfaceGroundFits(Kind kind, StructureStart made, int shift) {
+        if (kind.deep) return true;
+        Structure structure = made.getStructure();
+        GenerationStep.Decoration step = structure.step();
+        if (step == GenerationStep.Decoration.UNDERGROUND_STRUCTURES
+                || step == GenerationStep.Decoration.STRONGHOLDS
+                || step == GenerationStep.Decoration.UNDERGROUND_DECORATION) return true;
+        if (structure instanceof OceanMonumentStructure
+                || structure instanceof OceanRuinStructure
+                || structure instanceof ShipwreckStructure
+                || structure instanceof BuriedTreasureStructure) return true;
+        BoundingBox full = made.getBoundingBox().moved(0, shift, 0);
+        int cx = full.getCenter().getX(), cz = full.getCenter().getZ();
+        int centerGround = host.ground(cx, cz);
+        if (host.water(cx, cz) > centerGround + 2 && host.biome(cx, centerGround, cz).is(BiomeTags.IS_OCEAN)) return true;
+        if ((kind.relative || structure.terrainAdaptation() == TerrainAdjustment.BURY
+                || structure.terrainAdaptation() == TerrainAdjustment.ENCAPSULATE)
+                && full.maxY() < centerGround - 2) return true;
+        return piecesFit(made.getPieces(), host::ground);
+    }
+
+    /** Whether every piece of a surface structure fits the ground under its footprint. */
+    static boolean piecesFit(List<StructurePiece> pieces, IntBinaryOperator ground) {
+        for (StructurePiece piece : pieces) {
+            boolean rigid = !(piece instanceof PoolElementStructurePiece pool)
+                    || pool.getElement().getProjection() == StructureTemplatePool.Projection.RIGID;
+            if (!footprintFits(piece.getBoundingBox(), rigid, ground)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether the ground across a horizontal footprint is gentle enough for a surface piece:
+     * bounded relief across rigid buildings, and bounded full-span and half-span slope across a 3x3 sample grid.
+     */
+    static boolean footprintFits(BoundingBox box, boolean rigid, IntBinaryOperator ground) {
+        int x0 = box.minX(), x2 = box.maxX(), z0 = box.minZ(), z2 = box.maxZ();
+        if (x2 - x0 < MIN_SLOPE_SPAN) {
+            int mid = (x0 + x2) >> 1;
+            x0 = mid - (MIN_SLOPE_SPAN >> 1);
+            x2 = x0 + MIN_SLOPE_SPAN;
+        }
+        if (z2 - z0 < MIN_SLOPE_SPAN) {
+            int mid = (z0 + z2) >> 1;
+            z0 = mid - (MIN_SLOPE_SPAN >> 1);
+            z2 = z0 + MIN_SLOPE_SPAN;
+        }
+        int x1 = (x0 + x2) >> 1, z1 = (z0 + z2) >> 1;
+        int[] xs = {x0, x1, x2}, zs = {z0, z1, z2};
+        int[][] g = new int[3][3];
+        int low = Integer.MAX_VALUE, high = Integer.MIN_VALUE;
+        for (int ix = 0; ix < 3; ix++) for (int iz = 0; iz < 3; iz++) {
+            int h = ground.applyAsInt(xs[ix], zs[iz]);
+            g[ix][iz] = h;
+            low = Math.min(low, h);
+            high = Math.max(high, h);
+        }
+        int relief = high - low;
+        if (rigid && relief > MAX_PIECE_RELIEF) return false;
+        double spanX = x2 - x0, spanZ = z2 - z0;
+        double maxGx = 0, maxGz = 0;
+        for (int i = 0; i < 3; i++) {
+            maxGx = Math.max(maxGx, Math.abs(g[2][i] - g[0][i]) / spanX);
+            maxGz = Math.max(maxGz, Math.abs(g[i][2] - g[i][0]) / spanZ);
+        }
+        if (Math.hypot(maxGx, maxGz) > MAX_SLOPE) return false;
+        if (relief > MIN_LOCAL_SLOPE_RELIEF) {
+            double dx0 = x1 - x0, dx1 = x2 - x1, dz0 = z1 - z0, dz1 = z2 - z1;
+            for (int i = 0; i < 3; i++) {
+                if (Math.abs(g[1][i] - g[0][i]) / dx0 > MAX_LOCAL_SLOPE
+                        || Math.abs(g[2][i] - g[1][i]) / dx1 > MAX_LOCAL_SLOPE
+                        || Math.abs(g[i][1] - g[i][0]) / dz0 > MAX_LOCAL_SLOPE
+                        || Math.abs(g[i][2] - g[i][1]) / dz1 > MAX_LOCAL_SLOPE) return false;
+            }
+        }
+        return true;
+    }
+
     private static final Object STARTS = new Object();
+    /** Starts that threw, by start key: how many windows they threw in, and when the last began. */
+    private record StartFailure(int tries, long at) {}
+    private final ConcurrentHashMap<Long, StartFailure> startFailures = new ConcurrentHashMap<>();
+    static final int MOST_START_FAILURES = 3;
+    private volatile long startRetryNanos = 10_000_000_000L;
+
+    /** For tests: how long a start that threw is left before it is tried again. */
+    void startRetryAfter(long nanos) { startRetryNanos = nanos; }
 
     private StructureStart generate(StructureSet.StructureSelectionEntry entry, Frame frame, ChunkPos chunk) {
         Structure structure = entry.structure().value();
@@ -528,7 +977,9 @@ final class VanillaStructures {
                 ? biome -> biome.is(BiomeTags.IS_OCEAN) : structure.biomes()::contains;
         // Vanilla lays starts out on one thread; some piece builders (strongholds) keep static state
         synchronized (STARTS) {
-            return structure.generate(level.registryAccess(), frame, frame.getBiomeSource(), randomState, level.getStructureManager(),
+            // After waiting for the lock, behind other worlds' layouts: a closed world's lays nothing out.
+            if (closed) throw new java.util.concurrent.CancellationException("cubic world closed");
+            return structure.generate(registries, frame, frame.getBiomeSource(), randomState, level == null ? null : level.getStructureManager(),
                     seed, chunk, 0, frame.heights, biomes);
         }
     }
@@ -546,9 +997,12 @@ final class VanillaStructures {
                 future = mine;
                 try {
                     mine.complete(build(start));
+                } catch (java.util.concurrent.CancellationException closing) {
+                    overlays.remove(key, mine); // the world is closing: nothing half laid out is kept
+                    mine.complete(new Long2ObjectOpenHashMap<>());
                 } catch (RuntimeException | LinkageError e) {
                     LOGGER.warn("Cubic world: structure {} failed to place at chunk {}, {}",
-                            level.registryAccess().registryOrThrow(Registries.STRUCTURE).getKey(start.start.getStructure()), start.chunkX, start.chunkZ, e);
+                            registries.registryOrThrow(Registries.STRUCTURE).getKey(start.start.getStructure()), start.chunkX, start.chunkZ, e);
                     mine.complete(new Long2ObjectOpenHashMap<>());
                 }
             }
@@ -562,6 +1016,8 @@ final class VanillaStructures {
                 new BlockPos(start.chunkX << 4, (start.reach.minY() + start.reach.maxY()) >> 1, start.chunkZ << 4),
                 start.start.getStructure() instanceof OceanMonumentStructure ? start.start.getBoundingBox().minY() - 64 : CubeWorld.MIN_Y, seed,
                 RandomSource.create(startKey(start.kind, start.chunkX, start.chunkZ) ^ seed));
+        host.prepare(reads(start.start.getPieces(), start.frame.shift, start.start.getStructure().terrainAdaptation(), start.chunkX, start.chunkZ));
+        stopIfClosed();
         adapt(world, start);
         BoundingBox box = start.start.getBoundingBox();
         int[] seeds = seeding.getOrDefault(start.start.getStructure(), new int[]{GenerationStep.Decoration.SURFACE_STRUCTURES.ordinal(), 0});
@@ -571,11 +1027,127 @@ final class VanillaStructures {
             for (int cz = Math.max(box.minZ() >> 4, start.chunkZ - REACH); cz <= Math.min(box.maxZ() >> 4, start.chunkZ + REACH); cz++) {
                 long decoration = random.setDecorationSeed(seed, cx << 4, cz << 4);
                 random.setFeatureSeed(decoration, seeds[1], seeds[0]);
+                stopIfClosed();
                 BoundingBox chunkBox = new BoundingBox(cx << 4, frame.minY + 1, cz << 4, (cx << 4) + 15, frame.minY + frame.height - 1, (cz << 4) + 15);
                 start.start.placeInChunk(world, structures, frame, random, chunkBox, new ChunkPos(cx, cz));
             }
         world.postProcessAll();
         return patches(world);
+    }
+
+    /**
+     * The cubes a layout reads, as far as its pieces tell: their boxes and the terrain adaptation
+     * round them, in the chunks it is laid out in. An ancient city or a big mineshaft reads some
+     * hundreds, each a whole base cube (caves, ores, dungeons) to make.
+     */
+    static LongOpenHashSet reads(List<StructurePiece> pieces, int shift, TerrainAdjustment how, int chunkX, int chunkZ) {
+        LongOpenHashSet cubes = new LongOpenHashSet();
+        for (StructurePiece piece : pieces) {
+            BoundingBox p = piece.getBoundingBox().moved(0, shift, 0);
+            // As far as adapt reaches round a piece: beards fill down to ADAPT_FILL under its floor and cut up to
+            // ADAPT_HEADROOM over its top, ADAPT sideways; buried ones are wrapped 3 blocks round.
+            BoundingBox b = switch (how) {
+                case BEARD_THIN, BEARD_BOX -> new BoundingBox(p.minX() - ADAPT, p.minY() - ADAPT_FILL - 1, p.minZ() - ADAPT,
+                        p.maxX() + ADAPT, p.maxY() + ADAPT_HEADROOM, p.maxZ() + ADAPT);
+                case BURY, ENCAPSULATE -> p.inflatedBy(3);
+                default -> p.inflatedBy(1);
+            };
+            int y0 = Math.max(b.minY(), CubeWorld.MIN_Y) >> 4, y1 = Math.min(b.maxY(), CubeWorld.MAX_Y) >> 4;
+            for (int cx = Math.max(b.minX() >> 4, chunkX - REACH); cx <= Math.min(b.maxX() >> 4, chunkX + REACH); cx++)
+                for (int cz = Math.max(b.minZ() >> 4, chunkZ - REACH); cz <= Math.min(b.maxZ() >> 4, chunkZ + REACH); cz++)
+                    for (int cy = y0; cy <= y1; cy++) cubes.add(SectionPos.asLong(cx, cy, cz));
+        }
+        return cubes;
+    }
+
+    private void stopIfClosed() {
+        if (closed || Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException("cubic world closed");
+    }
+
+    /**
+     * A map kept in two generations: the newer fills to a size and becomes the older, and the older
+     * is dropped then. A hit in the older moves to the newer, so what is used stays. Reads take no
+     * lock. Writes take this map's lock, held only for a map operation, so a write never lands in a
+     * generation a roll has already passed over: a valid start put while another thread rolled was
+     * shadowed by the roller's failed result for the same key. A hit's move only tries the lock, and
+     * {@link #offer} too, so a reader (the server thread) never waits on a writer.
+     */
+    static final class Generations<V> {
+        /** Both generations, published together, so no reader sees one without the other. */
+        private record Pair<V>(ConcurrentHashMap<Long, V> newer, ConcurrentHashMap<Long, V> older) {}
+        private final int most;
+        private final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+        private volatile Pair<V> maps = new Pair<>(new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+        /** For tests: run inside a write, with the lock held, once it has read the generations. */
+        @Nullable private volatile Runnable writing;
+
+        Generations(int most) { this.most = most; }
+
+        @Nullable V get(long key) {
+            Pair<V> now = maps;
+            V found = now.newer.get(key);
+            if (found != null) return found;
+            found = now.older.get(key);
+            if (found == null || !lock.tryLock()) return found; // still read in the older while another thread writes
+            try { return keep(key, found); }
+            finally { lock.unlock(); }
+        }
+
+        boolean containsKey(long key) { return get(key) != null; }
+
+        void put(long key, V value) {
+            lock.lock();
+            try {
+                Pair<V> now = maps;
+                pause();
+                into(now).put(key, value);
+            } finally { lock.unlock(); }
+        }
+
+        /** The value kept: this one, or one already there in either generation, which wins. */
+        V putIfAbsent(long key, V value) {
+            lock.lock();
+            try { return keep(key, value); }
+            finally { lock.unlock(); }
+        }
+
+        /** As {@link #putIfAbsent}, but only if the lock is free: a cache fill nobody has to wait for. */
+        void offer(long key, V value) {
+            if (!lock.tryLock()) return;
+            try { keep(key, value); }
+            finally { lock.unlock(); }
+        }
+
+        /** Lock held. */
+        private V keep(long key, V value) {
+            Pair<V> now = maps;
+            pause();
+            V had = now.newer.get(key);
+            if (had != null) return had;
+            had = now.older.get(key);
+            V kept = had != null ? had : value;
+            into(now).put(key, kept);
+            return kept;
+        }
+
+        /** The generation a write goes into, rolling first where the newer is full. Lock held. */
+        private ConcurrentHashMap<Long, V> into(Pair<V> now) {
+            if (now.newer.size() < most) return now.newer;
+            Pair<V> next = new Pair<>(new ConcurrentHashMap<>(), now.newer);
+            maps = next;
+            return next.newer;
+        }
+
+        private void pause() {
+            Runnable hook = writing;
+            if (hook != null) hook.run();
+        }
+
+        /** For tests. */
+        void whileWriting(@Nullable Runnable hook) { writing = hook; }
+
+        /** For tests: whether another thread holds the write lock. */
+        boolean writeLocked() { return lock.isLocked(); }
     }
 
     /** Buckets a laid-out structure by cube. */
@@ -645,17 +1217,17 @@ final class VanillaStructures {
             int floor = floors.getInt(best);
             switch (how) {
                 case BEARD_THIN, BEARD_BOX -> {
-                    int top = floor - 1 - r;
-                    for (int y = top; y > top - ADAPT_HEIGHT; y--) {
+                    int top = floor - 1 - r, bottom = adaptFillBottom(floor);
+                    for (int y = top; y >= bottom; y--) {
                         BlockState was = world.realState(x, y, z);
                         if (was.blocksMotion() && !(was.getBlock() instanceof LeavesBlock)) break;
                         world.putReal(x, y, z, host.fill(x, y, z, top - y));
                     }
                     int from = floor + r, ground = host.ground(x, z);
-                    int to = how == TerrainAdjustment.BEARD_BOX ? box.maxY() - r : Math.max(ground, host.water(x, z)) + 24;
-                    for (int y = from; y <= Math.min(to, from + ADAPT_HEIGHT); y++)
+                    int to = adaptCutTop(how, box.maxY(), r, ground, host.water(x, z));
+                    for (int y = from; y <= to; y++)
                         if (!world.realState(x, y, z).isAir()) world.putReal(x, y, z, AIR);
-                    if (how == TerrainAdjustment.BEARD_THIN && from <= ground && world.realState(x, from - 1, z).blocksMotion())
+                    if (how == TerrainAdjustment.BEARD_THIN && from <= ground && ground <= to && world.realState(x, from - 1, z).blocksMotion())
                         world.putReal(x, from - 1, z, host.fill(x, from - 1, z, 0));
                 }
                 case BURY, ENCAPSULATE -> {
@@ -666,6 +1238,17 @@ final class VanillaStructures {
                 default -> {}
             }
         }
+    }
+
+    /** Lowest real Y filled beneath a piece floor by {@link #adapt}, bounding downhill pedestals. */
+    static int adaptFillBottom(int floor) {
+        return floor - ADAPT_FILL;
+    }
+
+    /** Highest real Y cleared to air above a piece by {@link #adapt}, bounding uphill cuts above the piece top. */
+    static int adaptCutTop(TerrainAdjustment how, int boxMaxY, int r, int ground, int water) {
+        if (how == TerrainAdjustment.BEARD_BOX) return boxMaxY - r;
+        return Math.min(Math.max(ground, water) + 4, boxMaxY + ADAPT_HEADROOM);
     }
 
     /** The base terrain for one layout, remembering the cube it last read. */

@@ -33,6 +33,7 @@ The first release of Earth Platform for Minecraft 1.21.1 and NeoForge 21.1.
 - Caves, ores and vanilla structures, including villages, strongholds, trial chambers and ancient cities; `/locate` and eyes of ender find them.
 - Nether and End through normal portals, with portals on the Earth linking back where you built them.
 - Pistons and sticky pistons, raids from Bad Omen, and bees in generated bee nests.
+- Chunk loading works on the Earth: `/forceload` keeps the spot you ran it from loaded and ticking at your height, so farms, furnaces, hoppers, mobs and machines keep going while you are away. Nether portal item loops and mods' chunk loaders (NeoForge's forced chunks, such as Advanced Peripherals' Chunky Turtle) keep their area loaded too, and forced spots survive a restart.
 
 ### Seeing far
 - Textured voxel far terrain out to about 94,000 blocks, at real height, with see-through far water, so distant ranges such as Denali and Annapurna stand clear on the horizon.
@@ -49,6 +50,7 @@ The first release of Earth Platform for Minecraft 1.21.1 and NeoForge 21.1.
 - An Earth world type, chosen by default in Create World, with a picker for famous places or any latitude and longitude.
 - You arrive on open ground with a landmark in sight, facing the view.
 - `/earth visit`, `/earth goto`, `/earth places`, `/earth where` and `/earth home`.
+- `/earth bug` files a report. With Bug Courier installed it opens that mod's report screen; without it, a prefilled GitHub issue. The game runs the same if Bug Courier is not installed.
 - The jet stream: glide with an elytra above Y 9,200 and the wind carries you at over 1,000 blocks a second, fast enough to cross a continent in under an hour.
 - A "Preparing your Earth" screen on first arrival, and a quiet note while data downloads or when it can't be reached.
 - A creative travel map: press N (or `/earth map`), click anywhere on the globe, and the camera flies out to the globe and back down at the new place.
@@ -65,6 +67,7 @@ The first release of Earth Platform for Minecraft 1.21.1 and NeoForge 21.1.
 ### Other mods
 - Xaero's Minimap, Xaero's World Map and JourneyMap map the Earth world, including ground above Y 2047.
 - Create contraptions (bearings, pistons and the rest) assemble in the Earth world.
+- Create's shafts, cogwheels and other machines Flywheel draws show in the Earth world after you rejoin, travel, or reload with F3+A or `/flywheel backend`, not only when placed in view, and light up when a torch is placed beside them.
 - Create Aeronautics ships assemble, fly and save in the Earth world, with air pressure from the real atmosphere. The jet stream carries ships east too, the altitude sensor reads from sea level to 10 km, and ships shade mobs at any height.
 - AE2 spatial storage captures and places Earth blocks, and AE2 meteorites generate in the Earth world.
 - Create's mechanical arm, pulley, scaffolding and elevators, Waystones, Mekanism (Digital Miner, multiblocks and pipes), Immersive Engineering's multiblocks and the Twilight Forest portal work in the Earth world.
@@ -80,6 +83,9 @@ The first release of Earth Platform for Minecraft 1.21.1 and NeoForge 21.1.
 - Layered clouds can turn the view white when you fly through the middle bank (about Y 3,400 to 4,200), show straight streaks on the top bank, and cut into distant mountains (contributed by VanceCStone, #161).
 - Create Aeronautics ships with players aboard ride the jet stream at 40 blocks a second; only empty ships reach elytra speed.
 - Create Aeronautics and Sable ships no longer shake far from the map origin: their physics runs near zero, so a ship at 10 million blocks moves as smoothly as one at the spawn (contributed by Cheesidibb1, #197).
+- Physics boxes and ropes (such as Aeronautics rope connectors) now work far from the map origin too, instead of pulling their ships toward a point millions of blocks away.
+- Dragging and rotating a ship with the physics staff far from the map origin turns it around the block you selected.
+- The physics staff's selection box, and other Create outlines drawn on ships, now sit exactly on their blocks far from the map origin.
 - In the Earth world, AE2's meteorite compass finds meteorites by map column only and doesn't notice blocks changed later.
 - Other mods that check build height or read chunks themselves may misbehave in the Earth world; please report them.
 - Blocks you place above Y 9,000 have no collision for a player gliding in the jet stream.

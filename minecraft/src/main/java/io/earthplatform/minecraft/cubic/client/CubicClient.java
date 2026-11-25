@@ -82,6 +82,8 @@ public final class CubicClient {
             world.far().tick();
         }
         if (flawless && world != null) Flawless.settle(world);
+        // Before LevelRenderer.renderLevel starts Flywheel's frame plan on its workers, as vanilla's light updates come.
+        if (world != null) io.earthplatform.minecraft.cubic.compat.FlywheelCompat.flushLight(world.client());
     }
 
     /**
@@ -228,7 +230,7 @@ public final class CubicClient {
         var camera = view.getPosition();
         ClientCubeWorld world = ClientCubeWorld.current();
         float height = (float) camera.y - world.skyTop(net.minecraft.util.Mth.floor(camera.x), net.minecraft.util.Mth.floor(camera.z));
-        float scale = FarRenderer.hazeAtEdge() ? 1.0F : world.far().hazeScale(camera.z), end = FarRenderer.fogEnd() * scale;
+        float scale = FarRenderer.hazeAtEdge() ? 1.0F : world.far().hazeScale(camera.x, camera.z), end = FarRenderer.fogEnd() * scale;
         float start = Math.min(Math.max(FarRenderer.fogStart() * scale, height * 1.25F), 0.8F * end);
         return new float[] {start, end};
     }

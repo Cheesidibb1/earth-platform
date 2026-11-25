@@ -2,7 +2,10 @@ package io.earthplatform.geography.globe;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.List;
@@ -48,6 +51,28 @@ class DiskCacheTest {
     }
 
     @Test
+    void trimsOlderCurrentSessionFilesOutsideGraceWindowWhenOverLimit() throws Exception {
+        Path oldSession = file("old-session", 100, 1_000);
+        Path earlierThisSession = file("earlier", 100, 5_000);
+        Path recentThisSession = file("recent", 100, 12_000);
+        DiskCache.trim(cache, 150 << 10, 4_000, 10_000);
+        assertFalse(Files.exists(oldSession));
+        assertFalse(Files.exists(earlierThisSession));
+        assertTrue(Files.exists(recentThisSession));
+    }
+
+    @Test
+    void hardCapEvictsEvenRecentBurstFilesWhenExceedingTwiceTheLimit() throws Exception {
+        Path a = file("a", 80, 10_000);
+        Path b = file("b", 80, 11_000);
+        Path c = file("c", 80, 12_000);
+        DiskCache.trim(cache, 100 << 10, 5_000, 9_000);
+        assertFalse(Files.exists(a));
+        assertFalse(Files.exists(b));
+        assertTrue(Files.exists(c));
+    }
+
+    @Test
     void readingAFileMarksItUsed() throws Exception {
         Path read = file("read", 1, 1_000);
         DiskCache.read(read);
@@ -72,5 +97,89 @@ class DiskCacheTest {
         for (Thread writer : writers) writer.join();
         assertEquals(List.of(), failed);
         try (var left = Files.list(target.getParent())) { assertEquals(List.of(target), left.toList(), "no .part files left behind"); }
+    }
+
+    @Test
+    void aLockedMoveIsRetriedThenReplacedPlainly() throws Exception {
+        Path target = cache.resolve("rows/5538.z");
+        Files.createDirectories(target.getParent());
+        Path temp = Files.createTempFile(target.getParent(), "part", ".part");
+        byte[] bytes = "climate".getBytes();
+        Files.write(temp, bytes);
+        int[] atomic = {0}, plain = {0};
+        long saved = DiskCache.retryWaitMs;
+        DiskCache.retryWaitMs = 0;
+        try {
+            DiskCache.moveIntoPlace(temp, target, (from, to, atom) -> {
+                if (atom) {
+                    atomic[0]++;
+                    throw new AccessDeniedException(from.toString(), to.toString(), "Access is denied");
+                }
+                plain[0]++;
+                Files.move(from, to);
+            });
+        } finally { DiskCache.retryWaitMs = saved; }
+        assertEquals(5, atomic[0]);
+        assertEquals(1, plain[0]);
+        assertArrayEquals(bytes, Files.readAllBytes(target));
+    }
+
+    @Test
+    void aSharingViolationKeepsAFileAnotherWriterAlreadyFinished() throws Exception {
+        Path target = cache.resolve("kept.z");
+        byte[] existing = new byte[] {1, 2, 3, 4};
+        Files.write(target, existing);
+        Path temp = Files.createTempFile(cache, "part", ".part");
+        Files.write(temp, new byte[] {9, 9, 9});
+        DiskCache.retryWaitMs = 0;
+        try {
+            DiskCache.moveIntoPlace(temp, target, (from, to, atom) -> {
+                throw new FileSystemException(from.toString(), to.toString(),
+                        "The process cannot access the file because it is being used by another process");
+            });
+        } finally { DiskCache.retryWaitMs = 5; }
+        assertArrayEquals(existing, Files.readAllBytes(target));
+        assertTrue(DiskCache.locked(new FileSystemException("a", "b", "The process cannot access the file because it is being used by another process")));
+        assertFalse(DiskCache.locked(new FileSystemException("a", "b", "No space left on device")));
+    }
+
+    @Test
+    void anEmptyFileDoesNotCountAsTheBytesBeingSaved() throws Exception {
+        Path target = cache.resolve("empty.z");
+        Files.write(target, new byte[0]);
+        Path temp = Files.createTempFile(cache, "part", ".part");
+        byte[] bytes = new byte[] {8, 8};
+        Files.write(temp, bytes);
+        DiskCache.retryWaitMs = 0;
+        try {
+            DiskCache.moveIntoPlace(temp, target, (from, to, atom) -> {
+                throw new AccessDeniedException(from.toString(), to.toString(), null);
+            });
+        } finally { DiskCache.retryWaitMs = 5; }
+        assertArrayEquals(bytes, Files.readAllBytes(target));
+    }
+
+    @Test
+    void aLockWithNoFileYetIsCopiedIntoPlace() throws Exception {
+        Path target = cache.resolve("copied.z");
+        Path temp = Files.createTempFile(cache, "part", ".part");
+        byte[] bytes = new byte[] {5, 6, 7};
+        Files.write(temp, bytes);
+        DiskCache.retryWaitMs = 0;
+        try {
+            DiskCache.moveIntoPlace(temp, target, (from, to, atom) -> {
+                throw new AccessDeniedException(from.toString(), to.toString(), null);
+            });
+        } finally { DiskCache.retryWaitMs = 5; }
+        assertArrayEquals(bytes, Files.readAllBytes(target));
+    }
+
+    @Test
+    void aMissingFileIsNotRetriedAsALock() {
+        Path temp = cache.resolve("missing-temp");
+        Path target = cache.resolve("missing-target");
+        assertThrows(NoSuchFileException.class, () -> DiskCache.moveIntoPlace(temp, target, (from, to, atom) -> {
+            throw new NoSuchFileException(from.toString());
+        }));
     }
 }

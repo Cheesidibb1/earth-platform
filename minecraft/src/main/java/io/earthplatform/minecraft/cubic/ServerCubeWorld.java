@@ -74,6 +74,10 @@ public final class ServerCubeWorld extends CubeWorld {
     private final CubeStorage storage;
     private final CubeCodec codec;
     private final ExecutorService workers;
+    /** Reads cubes from the save ahead of the workers, which generate the rest. */
+    private final ExecutorService reads;
+    /** Set as the world starts closing, before its last save. */
+    private volatile boolean closing;
     private final FarServer far;
     private final LongOpenHashSet pending = new LongOpenHashSet();
     /** Cubes whose generation failed (say, terrain data was unreachable), with the tick to try again. */
@@ -153,8 +157,14 @@ public final class ServerCubeWorld extends CubeWorld {
      * ground still owed their first animals; {@code edited} marks saved cubes changed by play; {@code kept} marks fresh
      * cubes to save as generated.
      */
+    /** A cube made or read off the server thread; {@code baseline} is its column's generated sky tops, read there too, or null. */
     private record Ready(long key, int x, int y, int z, @Nullable LevelChunkSection section, List<CompoundTag> blockEntities,
-                         List<CompoundTag> entities, boolean saved, boolean edited, boolean surface, boolean kept, @Nullable RuntimeException failure, int open) {}
+                         List<CompoundTag> entities, boolean saved, boolean edited, boolean surface, boolean kept, @Nullable RuntimeException failure, int open,
+                         @Nullable int[] baseline) {
+        Ready withBaseline(@Nullable int[] tops) {
+            return new Ready(key, x, y, z, section, blockEntities, entities, saved, edited, surface, kept, failure, open, tops);
+        }
+    }
     private record Lit(long key, int stamp, @Nullable byte[] values) {}
 
     private static final class Watcher {
@@ -210,6 +220,7 @@ public final class ServerCubeWorld extends CubeWorld {
         this.far = new FarServer(generator, storage, codec, level.registryAccess().registryOrThrow(Registries.BIOME));
         int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 2));
         this.workers = Executors.newFixedThreadPool(threads, NamedThreads.numbered("Earth cube worker", THREADS, Thread.NORM_PRIORITY - 1));
+        this.reads = Executors.newFixedThreadPool(2, NamedThreads.numbered("Earth cube reader", THREADS, Thread.NORM_PRIORITY - 1));
         this.surveys = new ColumnSurveys(SurfaceFlight.ENABLED, ALL_BURIED, workers,
                 (column, x, z) -> ColumnSurvey.of(column, x, z, generator, storage, SurfaceFlight.ENABLED));
         workers.execute(() -> {
@@ -223,7 +234,31 @@ public final class ServerCubeWorld extends CubeWorld {
     }
 
     public CubeGenerator generator() { return generator; }
+    @Override public double earthMetresPerBlock() { return generator instanceof io.earthplatform.minecraft.cubic.earth.EarthGenerator earth ? earth.grid().metresPerBlock() : 0; }
+    @Override @Nullable public io.earthplatform.geography.globe.GlobeProjection earthProjection() { return generator instanceof io.earthplatform.minecraft.cubic.earth.EarthGenerator earth ? earth.grid() : null; }
     public FarServer far() { return far; }
+
+    /** Times the server thread read the terrain for a column's sky tops; for checks that a path never does. */
+    private final java.util.concurrent.atomic.LongAdder syncTerrainReads = new java.util.concurrent.atomic.LongAdder();
+    public long syncTerrainReads() { return syncTerrainReads.sum(); }
+
+    /** Weather left out (snow and ice, lightning) in columns whose height isn't known yet; for checks. */
+    private final java.util.concurrent.atomic.LongAdder weatherLeftOut = new java.util.concurrent.atomic.LongAdder();
+    public long weatherLeftOut() { return weatherLeftOut.sum(); }
+
+    /**
+     * Server thread, from vanilla's chunk tick. Whether its weather (snow and ice, lightning) may run in a cube
+     * column: with a player near, as ever; else only once the column's sky tops are known, read off this thread
+     * for its held cubes (see {@link ChunkTickets#weatherRuns}). A column kept by a chunk ticket before its
+     * cubes are in, or one whose loader waits for the cap, is force-ticked by NeoForge's loaders, and working
+     * out its height for the weather read the terrain here.
+     */
+    public boolean weatherRuns(int chunkX, int chunkZ) {
+        long column = CubeKey.column(chunkX, chunkZ);
+        boolean runs = ChunkTickets.weatherRuns(columnWatched(column, horizontalRadius() + 2), tops.containsKey(column));
+        if (!runs) weatherLeftOut.increment();
+        return runs;
+    }
 
     /**
      * The generator's ground, which the server thread asks for (sending tops, lighting, spawning)
@@ -231,6 +266,7 @@ public final class ServerCubeWorld extends CubeWorld {
      * unknown for now rather than a crash.
      */
     @Override protected int baselineTop(int x, int z) {
+        if (server.getServer().isSameThread()) syncTerrainReads.increment();
         try { return generator.skyTopY(x, z); }
         catch (io.earthplatform.geography.MissingTerrainException missing) { return UNKNOWN_TOP; }
     }
@@ -284,10 +320,28 @@ public final class ServerCubeWorld extends CubeWorld {
         }
         pending.add(key);
         int x = CubeKey.x(key), y = CubeKey.y(key), z = CubeKey.z(key);
-        workers.execute(() -> {
-            TickShare.giveWay();
-            if (always || wanted(x, y, z)) { ready.add(produce(key, x, y, z)); generated.increment(); }
-            else { droppedKeys.add(key); dropped.increment(); }
+        // Read from the save first, on threads of their own, so a saved cube never waits behind cubes being generated.
+        reads.execute(() -> {
+            if (closing) return; // a read queued as the world closes would hold its region's lock against the last save
+            if (!always && !wanted(x, y, z)) { droppedKeys.add(key); dropped.increment(); return; }
+            Ready saved = readSaved(key, x, y, z);
+            if (saved != null) {
+                primeTops(x, z).whenComplete((tops, failure) -> {
+                    if (closing || failure != null) return; // cancelled as the world closed
+                    ready.add(saved.withBaseline(tops));
+                    generated.increment();
+                });
+                return;
+            }
+            try {
+                workers.execute(() -> {
+                    TickShare.giveWay();
+                    if (always || wanted(x, y, z)) { ready.add(generateCube(key, x, y, z)); generated.increment(); }
+                    else { droppedKeys.add(key); dropped.increment(); }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException closing) {
+                // the world closed meanwhile
+            }
         });
         return true;
     }
@@ -305,25 +359,105 @@ public final class ServerCubeWorld extends CubeWorld {
         return false;
     }
 
+    /** A cube read from the save, or generated where it is not saved (or its save cannot be read). */
     private Ready produce(long key, int x, int y, int z) {
+        Ready saved = readSaved(key, x, y, z);
+        return saved != null ? saved : generateCube(key, x, y, z);
+    }
+
+    /** A saved cube, or null where it is not saved or its save cannot be read (then it is generated again). */
+    @Nullable private Ready readSaved(long key, int x, int y, int z) {
         try {
             CompoundTag saved = storage.read(key);
-            if (saved != null) {
-                CubeCodec.Decoded decoded = codec.read(saved);
-                return new Ready(key, x, y, z, decoded.section(), decoded.blockEntities(), CubeCodec.tags(saved, CubeCodec.ENTITIES), true,
-                        !saved.getBoolean(CubeCodec.UNTOUCHED), saved.getBoolean(CubeCodec.UNPOPULATED), false, null, openFaces(decoded.section()));
-            }
+            if (saved == null) return null;
+            CubeCodec.Decoded decoded = codec.read(saved);
+            generator.loaded(x, y, z);
+            return new Ready(key, x, y, z, decoded.section(), decoded.blockEntities(), CubeCodec.tags(saved, CubeCodec.ENTITIES), true,
+                    !saved.getBoolean(CubeCodec.UNTOUCHED), saved.getBoolean(CubeCodec.UNPOPULATED), false, null, openFaces(decoded.section()), null);
         } catch (IOException | RuntimeException failure) {
             EarthPlatformMod.LOGGER.error("Could not read saved cube {}; regenerating it", CubeKey.toString(key), failure);
+            return null;
         }
+    }
+
+    /** A generated cube; a failure is a gap tried again shortly. */
+    private Ready generateCube(long key, int x, int y, int z) {
         try {
             List<CompoundTag> blockEntities = new ArrayList<>(), entities = new ArrayList<>();
             LevelChunkSection section = generator.generate(x, y, z, blockEntities, entities);
             int[] band = surfaceBand(x, z);
             boolean surface = band[0] + SAVED_BELOW == y;
-            return new Ready(key, x, y, z, section, blockEntities, entities, false, false, surface, saved(band, y, x, z), null, openFaces(section));
+            return new Ready(key, x, y, z, section, blockEntities, entities, false, false, surface, saved(band, y, x, z), null, openFaces(section),
+                    server.getServer().isSameThread() ? null : baselineNow(x, z));
         } catch (RuntimeException failure) {
-            return new Ready(key, x, y, z, null, List.of(), List.of(), false, false, false, false, failure, 0);
+            return new Ready(key, x, y, z, null, List.of(), List.of(), false, false, false, false, failure, 0, null);
+        }
+    }
+
+    /** Cube columns' generated sky tops, being read or read for {@link #primeTops}. */
+    private final java.util.concurrent.ConcurrentHashMap<Long, CompletableFuture<int[]>> primed = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Any thread but the server's. Reads, on the IO pool, the generated sky tops of a saved cube's
+     * column, which go with the cube so the server thread never reads terrain to adopt it. A
+     * generated cube's worker reads them making the cube; a saved one's read them only by laying its
+     * structures out, and since that is done aside the server thread was left to fetch the terrain
+     * itself, waiting seconds a tick after a restart. The cube is handed out once they are read;
+     * other cubes of the column wait on the same read without holding a thread. Where the map data
+     * is not in yet, the read is tried again later off the server thread, never left to adoption;
+     * when the world closes, reads still to come are cancelled.
+     */
+    private CompletableFuture<int[]> primeTops(int cubeX, int cubeZ) {
+        long column = CubeKey.column(cubeX, cubeZ);
+        CompletableFuture<int[]> mine = new CompletableFuture<>(), reading = primed.putIfAbsent(column, mine);
+        if (reading != null) return reading;
+        if (primed.size() > 4096) primed.values().removeIf(future -> future.isDone() && future != mine);
+        prime(cubeX, cubeZ, mine, 0);
+        return mine;
+    }
+
+    private void prime(int cubeX, int cubeZ, CompletableFuture<int[]> into, int tries) {
+        long column = CubeKey.column(cubeX, cubeZ);
+        java.util.concurrent.Executor pool = tries == 0 ? net.minecraft.Util.ioPool()
+                : CompletableFuture.delayedExecutor(Math.min(30, 1L << Math.min(tries, 5)), TimeUnit.SECONDS, net.minecraft.Util.ioPool());
+        try {
+            pool.execute(() -> {
+                if (closing) {
+                    into.cancel(false);
+                    primed.remove(column, into);
+                    return;
+                }
+                try {
+                    into.complete(baselineOf(cubeX, cubeZ));
+                } catch (RuntimeException missing) {
+                    prime(cubeX, cubeZ, into, tries + 1); // the map data is not in yet: read again later, here, not on the server thread
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            into.cancel(false);
+            primed.remove(column, into);
+        }
+    }
+
+    /** A column's generated sky tops, as {@link #baselineTop} gives them; throws where its map data is missing. */
+    private int[] baselineOf(int cubeX, int cubeZ) {
+        int[] tops = new int[256];
+        for (int i = 0; i < 256; i++) tops[i] = generator.skyTopY((cubeX << 4) + (i & 15), (cubeZ << 4) + (i >> 4));
+        return tops;
+    }
+
+    /** Workers, for a cube just generated, whose map data is in: its column's sky tops, kept for the column's other cubes. */
+    @Nullable private int[] baselineNow(int cubeX, int cubeZ) {
+        long column = CubeKey.column(cubeX, cubeZ);
+        CompletableFuture<int[]> had = primed.get(column);
+        if (had != null && had.isDone() && !had.isCompletedExceptionally()) return had.getNow(null);
+        try {
+            int[] tops = baselineOf(cubeX, cubeZ);
+            if (primed.size() > 4096) primed.values().removeIf(CompletableFuture::isDone);
+            primed.putIfAbsent(column, CompletableFuture.completedFuture(tops));
+            return tops;
+        } catch (RuntimeException missing) {
+            return null;
         }
     }
 
@@ -355,6 +489,57 @@ public final class ServerCubeWorld extends CubeWorld {
             ready = false;
             request(key, true);
         }
+        return ready;
+    }
+
+    /** Cubes kept loaded for arrivals waiting on them and for chunk tickets, though no player is near (see {@link ResidentCubes}). */
+    private final ResidentCubes resident = new ResidentCubes();
+
+    /** Chunk tickets ({@code /forceload}, portals, mods' chunk loaders) turned into cube holds; see {@link ChunkTickets}. */
+    private final ChunkTickets tickets = new ChunkTickets(new ChunkTickets.Host() {
+        @Override public boolean loaded(long cubeKey) { return cubes.containsKey(cubeKey); }
+        @Override public boolean request(long cubeKey) { return ServerCubeWorld.this.request(cubeKey, true); }
+        @Override public void keep(Object holder, long[] keys) { if (!closed) resident.keep(holder, keys); }
+        @Override public void release(Object holder) { resident.release(holder); }
+        @Override public int groundY(int x, int z) { return generator.surfaceY(x, z); }
+        @Override public void tell(Component line) { ChunkTickets.tellOperators(server.getServer(), line); }
+    }, task -> ServerCubeWorld.this.workers.execute(task)); // ground reads on the cube workers, a fixed pool
+
+    /** Most cubes chunk tickets may hold, from the settings. */
+    private static int ticketCap() {
+        try { return io.earthplatform.minecraft.cubic.play.EarthConfig.CHUNK_LOADER_CUBES.get(); }
+        catch (IllegalStateException notLoaded) { return io.earthplatform.minecraft.cubic.play.EarthConfig.DEFAULT_CHUNK_LOADER_CUBES; }
+    }
+
+    public ChunkTickets tickets() { return tickets; }
+
+    /**
+     * Server thread. Keeps the cubes about a block loaded for {@code holder} (an arrival waiting to
+     * land there), in place of what it kept before, until {@link #release}d or the world closes.
+     */
+    public void keepAround(Object holder, BlockPos at) {
+        if (!closed) resident.keep(holder, ResidentCubes.around(at));
+    }
+
+    /** Server thread. Lets go of the cubes {@code holder} kept; the unload pass drops them once no player is near. */
+    public void release(Object holder) { resident.release(holder); }
+
+    /** Server thread. Lands what {@code holder} waited for, then lets go of its cubes however that ends, so none is stranded. */
+    public void landHeld(Object holder, Runnable land) { resident.landing(holder, land); }
+
+    /** For checks: how many arrivals keep cubes, and whether a cube is kept. */
+    public int residentHolders() { return resident.holders(); }
+    public boolean resident(long cubeKey) { return resident.holds(cubeKey); }
+
+    /**
+     * Server thread. Whether the structures of the chunk columns about a block are known, so the
+     * first lookups there (YUNG's temples, mob spawns) answer right; asks for them aside until they
+     * are. Cubes read from the save leave their columns to be laid out so, and an arrival waits.
+     */
+    public boolean structuresReadyAround(BlockPos pos) {
+        int cx = pos.getX() >> 4, cz = pos.getZ() >> 4;
+        boolean ready = true;
+        for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) ready &= generator.structuresReady(cx + dx, cz + dz);
         return ready;
     }
 
@@ -496,6 +681,8 @@ public final class ServerCubeWorld extends CubeWorld {
         // Points of interest at cubic heights live only in memory: rebuild them from the blocks.
         server.getPoiManager().checkConsistencyWithBlocks(SectionPos.of(cube.x, cube.y, cube.z), cube.section);
         CubicPoiClaims.reclaim(server, SectionPos.of(cube.x, cube.y, cube.z));
+        long column = CubeKey.column(cube.x, cube.z);
+        if (result.baseline != null && !tops.containsKey(column)) tops.put(column, result.baseline.clone()); // read off this thread
         refreshTops(cube);
         staleLightAround(cube.x, cube.y, cube.z);
     }
@@ -598,12 +785,20 @@ public final class ServerCubeWorld extends CubeWorld {
             send(watcher, cx, cy, cz, cap);
             if (ticks % 10 == 0) unsend(watcher, h + 1, v + 1, cx, cy, cz, false, cap);
         }
+        // Chunk tickets' cubes come after players' own, a few a tick.
+        long ticketsStart = System.nanoTime();
+        if (ticks % ChunkTickets.EVERY == 0) {
+            ChunkTickets.Asks asks = tickets.gather(server);
+            tickets.reconcile(ticks, asks.forced(), asks.others(), ticketCap());
+        }
+        tickets.tick(ticks, MAX_PENDING - pending.size());
+        Timings.CHUNK_TICKETS.since(ticketsStart);
         flushChanges();
         far.tick(server.players());
         lightCubes();
         if (ticks % 20 == 0) populate();
         if (ticks % 40 == 0) unloadUnwatched(h + 2, v + 2);
-        randomTicks(v);
+        randomTicks(h, v);
     }
 
     /**
@@ -943,6 +1138,13 @@ public final class ServerCubeWorld extends CubeWorld {
         return grid;
     }
 
+    /** The watchers by where they are, in squares {@code reach} cube columns across. */
+    private PlayerGrid<Watcher> playerGrid(int reach) {
+        PlayerGrid<Watcher> grid = new PlayerGrid<>(reach);
+        for (Watcher watcher : watchers.values()) grid.add(watcher.player.getBlockX() >> 4, watcher.player.getBlockZ() >> 4, watcher);
+        return grid;
+    }
+
     /** The reach of {@link #watchedBy} in cube columns across: the band, a glider's sky builds, or the cubes ahead of a traveller. */
     private static int watchReach(int h) {
         return Math.max(h, Math.max(SKY_REACH + 2, leadMost(h - 2) + aheadRadius(h - 2) + 2));
@@ -970,6 +1172,15 @@ public final class ServerCubeWorld extends CubeWorld {
                 && (watcher.deep || edited || buried(x, y, z, cap) != 1);
     }
 
+    private boolean columnWatched(long column, int h) {
+        int x = CubeKey.columnX(column), z = CubeKey.columnZ(column);
+        for (Watcher watcher : watchers.values()) {
+            if (CubeOffsets.within(x - (watcher.player.getBlockX() >> 4), 0, z - (watcher.player.getBlockZ() >> 4), h, 0)) return true;
+        }
+        return false;
+    }
+
+    /** As {@link #columnWatched(long, int)}, asking only the watchers {@code grid} has near the column. */
     private static boolean columnWatched(long column, int h, PlayerGrid<Watcher> grid) {
         int x = CubeKey.columnX(column), z = CubeKey.columnZ(column);
         return grid.any(x, z, watcher -> CubeOffsets.within(x - (watcher.player.getBlockX() >> 4), 0, z - (watcher.player.getBlockZ() >> 4), h, 0));
@@ -984,7 +1195,7 @@ public final class ServerCubeWorld extends CubeWorld {
     private void unload(int h, int v) {
         List<Cube> drop = new ArrayList<>();
         PlayerGrid<Watcher> near = watcherGrid(watchReach(h));
-        for (Cube cube : cubes.values()) if (!watched(cube.key, h, v, cube.edited, near)) drop.add(cube);
+        for (long key : ResidentCubes.unloadable(cubes.keySet(), key -> watched(key, h, v, cubes.get(key).edited, near), resident)) drop.add(cubes.get(key));
         if (drop.isEmpty()) return;
         for (Cube cube : drop) {
             store(cube);
@@ -993,22 +1204,29 @@ public final class ServerCubeWorld extends CubeWorld {
         }
         // Keep sky tops near players only; far columns are rebuilt from the generator and cubes.
         PlayerGrid<Watcher> wide = watcherGrid(h * 3);
-        tops.long2ObjectEntrySet().removeIf(entry -> !columnWatched(entry.getLongKey(), h * 3, wide));
-        surveys.prune(column -> columnWatched(column, h * 3, wide));
+        tops.long2ObjectEntrySet().removeIf(entry -> !columnWatched(entry.getLongKey(), h * 3, wide) && !resident.holdsColumn(entry.getLongKey()));
+        surveys.prune(column -> columnWatched(column, h * 3, wide) || resident.holdsColumn(column));
         long start = System.nanoTime();
         storage.flushLater();
         Timings.CUBE_FLUSH.since(start);
     }
 
-    private void randomTicks(int v) {
+    /**
+     * Random ticks (crops, saplings, grass, ice), as vanilla's: for cubes near a player, and for cubes a
+     * chunk ticket holds with nobody near, so a forced farm grows while nobody is there, as in later
+     * versions of the game. A held cube ticks only with the cubes a growth reaches round it loaded (see
+     * {@link ChunkTickets#randomTicks}): at the edge of a hold a tree grew into unloaded cubes, which read
+     * as air and drop what is written there. Nothing ticks while the game's tick is frozen.
+     */
+    private void randomTicks(int h, int v) {
         int speed = server.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
-        if (speed <= 0 || watchers.isEmpty()) return;
+        if (speed <= 0 || watchers.isEmpty() && tickets.holds() == 0 || !server.tickRateManager().runsNormally()) return;
         RandomSource random = server.getRandom();
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        boolean[] heights = watchedHeights(v);
+        PlayerGrid<Watcher> players = playerGrid(h + 2);
         for (Cube cube : cubes.values()) {
-            if (!cube.section.isRandomlyTicking() || !heights[cube.y - (CubeWorld.MIN_Y >> 4)]) continue;
-            if (!server.shouldTickBlocksAt(ChunkPos.asLong(cube.x, cube.z))) continue;
+            if (!cube.section.isRandomlyTicking() || !server.shouldTickBlocksAt(ChunkPos.asLong(cube.x, cube.z))) continue;
+            if (!nearPlayer(cube, h, v, players) && !tickets.randomTicks(cube.key)) continue;
             int x0 = cube.x << 4, y0 = cube.y << 4, z0 = cube.z << 4;
             for (int i = 0; i < speed; i++) {
                 int bx = random.nextInt(16), by = random.nextInt(16), bz = random.nextInt(16);
@@ -1022,17 +1240,13 @@ public final class ServerCubeWorld extends CubeWorld {
     }
 
     /**
-     * Which cube Ys lie within {@code v} of some player, from the lowest cube up: worked out once a tick, where asking
-     * every player about every loaded cube cost a hundred players' server millions of checks a tick.
+     * Whether a cube is near a player's height, and inside the reach round some player. {@code players} holds them by
+     * where they are ({@link #playerGrid}): asking every player about every loaded cube cost a hundred players' server
+     * millions of checks a tick.
      */
-    private boolean[] watchedHeights(int v) {
-        int bottom = CubeWorld.MIN_Y >> 4;
-        boolean[] heights = new boolean[(CubeWorld.MAX_Y >> 4) - bottom + 1];
-        for (Watcher watcher : watchers.values()) {
-            int cy = watcher.player.getBlockY() >> 4;
-            for (int y = Math.max(0, cy - v - bottom), top = Math.min(heights.length - 1, cy + v - bottom); y <= top; y++) heights[y] = true;
-        }
-        return heights;
+    private static boolean nearPlayer(Cube cube, int h, int v, PlayerGrid<Watcher> players) {
+        return players.any(cube.x, cube.z, watcher -> CubeOffsets.within(cube.x - (watcher.player.getBlockX() >> 4), cube.y - (watcher.player.getBlockY() >> 4),
+                cube.z - (watcher.player.getBlockZ() >> 4), h + 2, v));
     }
 
     // Spawning -----------------------------------------------------------------------------------
@@ -1124,23 +1338,57 @@ public final class ServerCubeWorld extends CubeWorld {
         for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) staleLight(CubeKey.pack(cx + dx, cy + dy, cz + dz));
     }
 
+    /** Cubes whose light waits on a column's sky tops being read off this thread; asked again every second. */
+    private final LongOpenHashSet lightLater = new LongOpenHashSet();
+
+    /**
+     * Server thread. A column's sky tops if they are known here or were read off this thread, else null,
+     * and they are asked for there ({@link #primeTops}): a held farm's edge sat beside columns nobody had
+     * loaded, and working their tops out here read the terrain, waiting on map data.
+     */
+    @Nullable private int[] readyTops(int cubeX, int cubeZ) {
+        long column = CubeKey.column(cubeX, cubeZ);
+        int[] known = tops.get(column);
+        if (known != null) return known;
+        CompletableFuture<int[]> read = primeTops(cubeX, cubeZ);
+        if (!read.isDone() || read.isCompletedExceptionally()) return null;
+        int[] baseline = read.getNow(null);
+        if (baseline == null) return null;
+        tops.put(column, baseline.clone());
+        return tops.get(column);
+    }
+
     @SuppressWarnings("unchecked")
     private void lightCubes() {
         for (Lit result; (result = lit.poll()) != null; ) {
             lightPending.remove(result.key);
             if (result.values != null && cubes.containsKey(result.key)) light.put(result.key, result);
         }
-        for (int budget = LIGHT_PER_TICK; budget > 0 && !lightWanted.isEmpty(); ) {
+        if (ticks % 20 == 0 && !lightLater.isEmpty()) {
+            for (LongIterator it = lightLater.iterator(); it.hasNext(); ) {
+                long key = it.nextLong();
+                if (cubes.containsKey(key)) lightWanted.add(key);
+            }
+            lightLater.clear();
+        }
+        for (int budget = LIGHT_PER_TICK, scans = 0; budget > 0 && !lightWanted.isEmpty() && scans < 4 * LIGHT_PER_TICK; scans++) {
             long key = lightWanted.removeFirstLong();
             Cube cube = cubes.get(key);
             if (cube == null || lightPending.contains(key)) continue;
+            // The sky tops of the nine columns round it, as known or read off this thread; never read from the terrain here.
+            int[][] columns = new int[9][];
+            boolean ready = true;
+            for (int c = 0; c < 9 && ready; c++) {
+                int[] known = readyTops(cube.x + c % 3 - 1, cube.z + c / 3 - 1);
+                if (known == null) ready = false;
+                else columns[c] = known.clone();
+            }
+            if (!ready) { lightLater.add(key); continue; } // lit once the missing tops are read
             PalettedContainer<BlockState>[] states = new PalettedContainer[27];
             for (int c = 0; c < 27; c++) {
                 Cube near = cubes.get(CubeKey.pack(cube.x + c % 3 - 1, cube.y + c / 9 - 1, cube.z + c / 3 % 3 - 1));
                 states[c] = near == null ? null : near.section.getStates().copy();
             }
-            int[][] columns = new int[9][];
-            for (int c = 0; c < 9; c++) columns[c] = topsFor(cube.x + c % 3 - 1, cube.z + c / 3 - 1).clone();
             int stamp = lightStamps.get(key), cy = cube.y;
             lightPending.add(key);
             workers.execute(() -> {
@@ -1241,10 +1489,21 @@ public final class ServerCubeWorld extends CubeWorld {
 
     public void close() {
         if (closed) return;
+        // Reads still queued, and terrain reads for them, are dropped first: a read waiting on a slow disk held
+        // its region's lock against the last save.
+        closing = true;
+        reads.shutdownNow();
+        // A read already reading holds its region until it is done: give it a moment, never longer, then save regardless.
+        try { reads.awaitTermination(2, TimeUnit.SECONDS); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        for (CompletableFuture<int[]> prime : primed.values()) prime.cancel(false);
+        tickets.close();
+        resident.clear();
         for (Cube cube : cubes.values()) store(cube, true);
         try { storage.close(); }
         catch (IOException failure) { EarthPlatformMod.LOGGER.error("Could not write cube regions", failure); }
         closed = true;
+        generator.detach();
         surveys.close();
         prefetch.close();
         workers.shutdownNow();
@@ -1256,7 +1515,8 @@ public final class ServerCubeWorld extends CubeWorld {
         int standing = 0;
         for (Watcher watcher : watchers.values()) standing += watcher.stood.size();
         return generator.id() + ", " + cubes.size() + " cubes loaded, " + standing + " buried cubes stood in for, " + surveys.opened() + " opened by caves, " + pending.size() + " pending (" + generated + " made, " + dropped + " dropped as no longer wanted), " + light.size() + " lit, "
-                + watchers.size() + " watching (" + fastWatchers() + " travelling fast), " + prefetch.describe() + ", "
+                + watchers.size() + " watching (" + fastWatchers() + " travelling fast), " + tickets.holds() + " chunk-ticket holds of " + tickets.heldCubes() + " cubes"
+                + (tickets.leftOut() > 0 ? " (" + tickets.leftOut() + " over the limit)" : "") + ", " + prefetch.describe() + ", "
                 + serverLoads.sum() + " cubes made on the server thread" + (serverLoads.sum() > 0 ? String.format(java.util.Locale.ROOT, " (%.1f ms each)", serverLoadNanos.sum() / 1e6 / serverLoads.sum()) : "") + ", "
                 + far.cached() + " far columns cached, " + far.stored() + ", " + far.made() + ", " + far.builds() + (failures > 0 ? ", " + failures + " generation failures" : "");
     }

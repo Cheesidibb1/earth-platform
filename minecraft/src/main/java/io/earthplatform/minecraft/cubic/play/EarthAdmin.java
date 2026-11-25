@@ -105,7 +105,7 @@ public final class EarthAdmin {
         GeoPoint centre = here != null ? here : EarthCommands.spawnPoint(source, earth);
         int[] middle = earth.block(centre.latitude(), centre.longitude());
         // Blocks are about a meter; the grid is in blocks, so its reach is close enough to kilometers.
-        double reach = km * 1000 / earth.grid().groundMetresPerBlock(middle[1]);
+        double reach = km * 1000 / earth.grid().groundMetresPerBlock(middle[0], middle[1]);
         List<int[]> points = new ArrayList<>();
         int steps = (int) Math.ceil(reach / PRELOAD_STEP);
         for (int i = -steps; i <= steps; i++) for (int j = -steps; j <= steps; j++) {
@@ -127,7 +127,7 @@ public final class EarthAdmin {
         EarthGenerator earth = EarthCommands.earth(source);
         if (earth == null) { source.sendFailure(Component.literal("This world has no Earth.")); return 0; }
         int[] from = earth.block(fromLatitude, fromLongitude), to = earth.block(toLatitude, toLongitude);
-        double metres = earth.grid().groundMetresPerBlock((from[1] + to[1]) / 2);
+        double metres = earth.grid().groundMetresPerBlock((from[0] + to[0]) / 2.0, (from[1] + to[1]) / 2.0);
         List<int[]> points = routePoints(from, to, widthKm * 1000 / metres, PRELOAD_STEP);
         if (points.size() > ROUTE_MOST_POINTS) {
             source.sendFailure(Component.literal(String.format(Locale.ROOT, "That route needs %d areas; at most %d are fetched at once. Split it or make it narrower.",
